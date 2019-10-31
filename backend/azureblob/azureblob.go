@@ -154,6 +154,7 @@ type Fs struct {
 	svcURL        *azblob.ServiceURL              // reference to serviceURL
 	cntURLcacheMu sync.Mutex                      // mutex to protect cntURLcache
 	cntURLcache   map[string]*azblob.ContainerURL // reference to containerURL per container
+	resURL        *azblob.BlobURL                 // reference to resourceURL
 	rootContainer string                          // container part of root (if any)
 	rootDirectory string                          // directory part of root (if any)
 	isLimited     bool                            // if limited to one container
@@ -312,9 +313,6 @@ func httpClientFactory(client *http.Client) pipeline.Factory {
 //
 // this code was copied from azblob.NewPipeline
 func (f *Fs) newPipeline(c azblob.Credential, o azblob.PipelineOptions) pipeline.Pipeline {
-	// Don't log stuff to syslog/Windows Event log
-	pipeline.SetForceLogEnabled(false)
-
 	// Closest to API goes first; closest to the wire goes last
 	factories := []pipeline.Factory{
 		azblob.NewTelemetryPolicyFactory(o.Telemetry),
@@ -421,7 +419,10 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		pipeline := f.newPipeline(azblob.NewAnonymousCredential(), azblob.PipelineOptions{Retry: azblob.RetryOptions{TryTimeout: maxTryTimeout}})
 		// Check if we have container level SAS or account level sas
 		parts := azblob.NewBlobURLParts(*u)
-		if parts.ContainerName != "" {
+		if parts.BlobName != "" {
+			resourceURL := azblob.NewBlobURL(*u, pipeline)
+			f.resURL = &resourceURL
+		} else if parts.ContainerName != "" {
 			if f.rootContainer != "" && parts.ContainerName != f.rootContainer {
 				return nil, errors.New("Container name in SAS URL and container provided in command do not match")
 			}
@@ -500,7 +501,11 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // getBlobReference creates an empty blob reference with no metadata
 func (f *Fs) getBlobReference(container, containerPath string) azblob.BlobURL {
-	return f.cntURL(container).NewBlobURL(containerPath)
+	if f.resURL == nil {
+		return f.cntURL(container).NewBlobURL(containerPath)
+	} else {
+		return *f.resURL
+	}
 }
 
 // updateMetadataWithModTime adds the modTime passed in to o.meta.
@@ -928,9 +933,11 @@ func (f *Fs) Purge(ctx context.Context) error {
 // If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	dstContainer, dstPath := f.split(remote)
-	err := f.makeContainer(ctx, dstContainer)
-	if err != nil {
-		return nil, err
+	if f.resURL == nil {
+		err := f.makeContainer(ctx, dstContainer)
+		if err != nil {
+			return nil, err
+		}
 	}
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -1378,9 +1385,11 @@ outer:
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	container, _ := o.split()
-	err = o.fs.makeContainer(ctx, container)
-	if err != nil {
-		return err
+	if o.fs.resURL == nil {
+		err = o.fs.makeContainer(ctx, container)
+		if err != nil {
+			return err
+		}
 	}
 	size := src.Size()
 	// Update Mod time

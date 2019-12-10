@@ -192,7 +192,7 @@ Contributors
   * Sheldon Rupp <me@shel.io>
   * albertony <12441419+albertony@users.noreply.github.com>
   * cron410 <cron410@gmail.com>
-  * Anagh Kumar Baranwal <anaghk.dos@gmail.com>
+  * Anagh Kumar Baranwal <anaghk.dos@gmail.com> <6824881+darthShadow@users.noreply.github.com>
   * Felix Brucker <felix@felixbrucker.com>
   * Santiago Rodríguez <scollazo@users.noreply.github.com>
   * Craig Miskell <craig.miskell@fluxfederation.com>
@@ -263,7 +263,7 @@ Contributors
   * garry415 <garry.415@gmail.com>
   * forgems <forgems@gmail.com>
   * Florian Apolloner <florian@apolloner.eu>
-  * Aleksandar Jankovic <office@ajankovic.com>
+  * Aleksandar Janković <office@ajankovic.com> <ajankovic@users.noreply.github.com>
   * Maran <maran@protonmail.com>
   * nguyenhuuluan434 <nguyenhuuluan434@gmail.com>
   * Laura Hausmann <zotan@zotan.pw> <laura@hausmann.dev>
@@ -308,3 +308,11 @@ Contributors
   * dausruddin <5763466+dausruddin@users.noreply.github.com>
   * zero-24 <zero-24@users.noreply.github.com>
   * Xiaoxing Ye <ye@xiaoxing.us>
+  * Barry Muldrey <barry@muldrey.net>
+  * Sebastian Brandt <sebastian.brandt@friday.de>
+  * Marco Molteni <marco.molteni@mailbox.org>
+  * Ankur Gupta <ankur0493@gmail.com>
+  * Maciej Zimnoch <maciej@scylladb.com>
+  * anuar45 <serdaliyev.anuar@gmail.com>
+  * Fernando <ferferga@users.noreply.github.com>
+  * David Cole <david.cole@sohonet.com>

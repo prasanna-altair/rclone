@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -693,15 +694,36 @@ The minimum is 0 and the maximum is 5GB.`,
 			Name: "chunk_size",
 			Help: `Chunk size to use for uploading.
 
-When uploading files larger than upload_cutoff they will be uploaded
-as multipart uploads using this chunk size.
+When uploading files larger than upload_cutoff or files with unknown
+size (eg from "rclone rcat" or uploaded with "rclone mount" or google
+photos or google docs) they will be uploaded as multipart uploads
+using this chunk size.
 
 Note that "--s3-upload-concurrency" chunks of this size are buffered
 in memory per transfer.
 
 If you are transferring large files over high speed links and you have
-enough memory, then increasing this will speed up the transfers.`,
+enough memory, then increasing this will speed up the transfers.
+
+Rclone will automatically increase the chunk size when uploading a
+large file of known size to stay below the 10,000 chunks limit.
+
+Files of unknown size are uploaded with the configured
+chunk_size. Since the default chunk size is 5MB and there can be at
+most 10,000 chunks, this means that by default the maximum size of
+file you can stream upload is 48GB.  If you wish to stream upload
+larger files then you will need to increase chunk_size.`,
 			Default:  minChunkSize,
+			Advanced: true,
+		}, {
+			Name: "copy_cutoff",
+			Help: `Cutoff for switching to multipart copy
+
+Any files larger than this that need to be server side copied will be
+copied in chunks of this size.
+
+The minimum is 0 and the maximum is 5GB.`,
+			Default:  fs.SizeSuffix(maxSizeForCopy),
 			Advanced: true,
 		}, {
 			Name:     "disable_checksum",
@@ -771,12 +793,11 @@ WARNING: Storing parts of an incomplete multipart upload counts towards space us
 
 // Constants
 const (
-	metaMtime           = "Mtime"                       // the meta key to store mtime in - eg X-Amz-Meta-Mtime
-	metaMD5Hash         = "Md5chksum"                   // the meta key to store md5hash in
-	listChunkSize       = 1000                          // number of items to read at once
-	maxRetries          = 10                            // number of retries to make of operations
-	maxSizeForCopy      = 5 * 1024 * 1024 * 1024        // The maximum size of object we can COPY
-	maxFileSize         = 5 * 1024 * 1024 * 1024 * 1024 // largest possible upload file size
+	metaMtime           = "Mtime"                // the meta key to store mtime in - eg X-Amz-Meta-Mtime
+	metaMD5Hash         = "Md5chksum"            // the meta key to store md5hash in
+	listChunkSize       = 1000                   // number of items to read at once
+	maxRetries          = 10                     // number of retries to make of operations
+	maxSizeForCopy      = 5 * 1024 * 1024 * 1024 // The maximum size of object we can COPY
 	minChunkSize        = fs.SizeSuffix(s3manager.MinUploadPartSize)
 	defaultUploadCutoff = fs.SizeSuffix(200 * 1024 * 1024)
 	maxUploadCutoff     = fs.SizeSuffix(5 * 1024 * 1024 * 1024)
@@ -798,6 +819,7 @@ type Options struct {
 	SSEKMSKeyID           string        `config:"sse_kms_key_id"`
 	StorageClass          string        `config:"storage_class"`
 	UploadCutoff          fs.SizeSuffix `config:"upload_cutoff"`
+	CopyCutoff            fs.SizeSuffix `config:"copy_cutoff"`
 	ChunkSize             fs.SizeSuffix `config:"chunk_size"`
 	DisableChecksum       bool          `config:"disable_checksum"`
 	SessionToken          string        `config:"session_token"`
@@ -1642,7 +1664,7 @@ func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPa
 		req.StorageClass = &f.opt.StorageClass
 	}
 
-	if srcSize >= int64(f.opt.UploadCutoff) {
+	if srcSize >= int64(f.opt.CopyCutoff) {
 		return f.copyMultipart(ctx, req, dstBucket, dstPath, srcBucket, srcPath, srcSize)
 	}
 	return f.pacer.Call(func() (bool, error) {
@@ -1655,8 +1677,8 @@ func calculateRange(partSize, partIndex, numParts, totalSize int64) string {
 	start := partIndex * partSize
 	var ends string
 	if partIndex == numParts-1 {
-		if totalSize >= 0 {
-			ends = strconv.FormatInt(totalSize, 10)
+		if totalSize >= 1 {
+			ends = strconv.FormatInt(totalSize-1, 10)
 		}
 	} else {
 		ends = strconv.FormatInt(start+partSize-1, 10)
@@ -1693,7 +1715,7 @@ func (f *Fs) copyMultipart(ctx context.Context, req *s3.CopyObjectInput, dstBuck
 		}
 	}()
 
-	partSize := int64(f.opt.ChunkSize)
+	partSize := int64(f.opt.CopyCutoff)
 	numParts := (srcSize-1)/partSize + 1
 
 	var parts []*s3.CompletedPart
@@ -1921,11 +1943,6 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	}
 	o.meta[metaMtime] = aws.String(swift.TimeToFloatString(modTime))
 
-	if o.bytes >= maxSizeForCopy {
-		fs.Debugf(o, "SetModTime is unsupported for objects bigger than %v bytes", fs.SizeSuffix(maxSizeForCopy))
-		return nil
-	}
-
 	// Can't update metadata here, so return this error to force a recopy
 	if o.storageClass == "GLACIER" || o.storageClass == "DEEP_ARCHIVE" {
 		return fs.ErrorCantSetModTime
@@ -1982,6 +1999,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	return resp.Body, nil
 }
 
+var warnStreamUpload sync.Once
+
 // Update the Object from in with modTime and size
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	bucket, bucketPath := o.split()
@@ -2001,10 +2020,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			u.S3 = o.fs.c
 			u.PartSize = int64(o.fs.opt.ChunkSize)
 
+			// size can be -1 here meaning we don't know the size of the incoming file.  We use ChunkSize
+			// buffers here (default 5MB). With a maximum number of parts (10,000) this will be a file of
+			// 48GB which seems like a not too unreasonable limit.
 			if size == -1 {
-				// Make parts as small as possible while still being able to upload to the
-				// S3 file size limit. Rounded up to nearest MB.
-				u.PartSize = (((maxFileSize / s3manager.MaxUploadParts) >> 20) + 1) << 20
+				warnStreamUpload.Do(func() {
+					fs.Logf(o.fs, "Streaming uploads using chunk size %v will have maximum file size of %v",
+						o.fs.opt.ChunkSize, fs.SizeSuffix(u.PartSize*s3manager.MaxUploadParts))
+				})
 				return
 			}
 			// Adjust PartSize until the number of parts is small enough.
@@ -2023,7 +2046,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// read the md5sum if available for non multpart and if
 	// disable checksum isn't present.
 	var md5sum string
-	if !multipart || !o.fs.opt.DisableChecksum {
+	if !multipart && !o.fs.opt.DisableChecksum {
 		hash, err := src.Hash(ctx, hash.MD5)
 		if err == nil && matchMd5.MatchString(hash) {
 			hashBytes, err := hex.DecodeString(hash)

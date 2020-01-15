@@ -402,6 +402,7 @@ func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Obj
 		// Retry if err returned a retry error
 		if fserrors.IsRetryError(err) || fserrors.ShouldRetry(err) {
 			fs.Debugf(src, "Received error: %v - low level retry %d/%d", err, tries, maxTries)
+			tr.Reset() // skip incomplete accounting - will be overwritten by retry
 			continue
 		}
 		// otherwise finish
@@ -778,10 +779,12 @@ func (c *checkMarch) Match(ctx context.Context, dst, src fs.DirEntry) (recurse b
 				atomic.AddInt32(&c.differences, 1)
 			} else {
 				atomic.AddInt32(&c.matches, 1)
-				fs.Debugf(dstX, "OK")
-			}
-			if noHash {
-				atomic.AddInt32(&c.noHashes, 1)
+				if noHash {
+					atomic.AddInt32(&c.noHashes, 1)
+					fs.Debugf(dstX, "OK - could not check hash")
+				} else {
+					fs.Debugf(dstX, "OK")
+				}
 			}
 		} else {
 			err := errors.Errorf("is file on %v but directory on %v", c.fsrc, c.fdst)
@@ -1705,11 +1708,14 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 	}
 
 	// Find dst object if it exists
-	dstObj, err := fdst.NewObject(ctx, dstFileName)
-	if err == fs.ErrorObjectNotFound {
-		dstObj = nil
-	} else if err != nil {
-		return err
+	var dstObj fs.Object
+	if !fs.Config.NoCheckDest {
+		dstObj, err = fdst.NewObject(ctx, dstFileName)
+		if err == fs.ErrorObjectNotFound {
+			dstObj = nil
+		} else if err != nil {
+			return err
+		}
 	}
 
 	// Special case for changing case of a file on a case insensitive remote

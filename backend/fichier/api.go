@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -17,6 +18,7 @@ import (
 // retryErrorCodes is a slice of error codes that we will retry
 var retryErrorCodes = []int{
 	429, // Too Many Requests.
+	403, // Forbidden (may happen when request limit is exceeded)
 	500, // Internal Server Error
 	502, // Bad Gateway
 	503, // Service Unavailable
@@ -27,6 +29,20 @@ var retryErrorCodes = []int{
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
 func shouldRetry(resp *http.Response, err error) (bool, error) {
+	// Detect this error which the integration tests provoke
+	// error HTTP error 403 (403 Forbidden) returned body: "{\"message\":\"Flood detected: IP Locked #374\",\"status\":\"KO\"}"
+	//
+	// https://1fichier.com/api.html
+	//
+	// file/ls.cgi is limited :
+	//
+	// Warning (can be changed in case of abuses) :
+	// List all files of the account is limited to 1 request per hour.
+	// List folders is limited to 5 000 results and 1 request per folder per 30s.
+	if err != nil && strings.Contains(err.Error(), "Flood detected") {
+		fs.Debugf(nil, "Sleeping for 30 seconds due to: %v", err)
+		time.Sleep(30 * time.Second)
+	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
@@ -109,7 +125,7 @@ func (f *Fs) listFiles(ctx context.Context, directoryID int) (filesList *FilesLi
 	}
 	for i := range filesList.Items {
 		item := &filesList.Items[i]
-		item.Filename = enc.ToStandardName(item.Filename)
+		item.Filename = f.opt.Enc.ToStandardName(item.Filename)
 	}
 
 	return filesList, nil
@@ -135,10 +151,10 @@ func (f *Fs) listFolders(ctx context.Context, directoryID int) (foldersList *Fol
 	if err != nil {
 		return nil, errors.Wrap(err, "couldn't list folders")
 	}
-	foldersList.Name = enc.ToStandardName(foldersList.Name)
+	foldersList.Name = f.opt.Enc.ToStandardName(foldersList.Name)
 	for i := range foldersList.SubFolders {
 		folder := &foldersList.SubFolders[i]
-		folder.Name = enc.ToStandardName(folder.Name)
+		folder.Name = f.opt.Enc.ToStandardName(folder.Name)
 	}
 
 	// fs.Debugf(f, "Got FoldersList for id `%s`", directoryID)
@@ -147,11 +163,6 @@ func (f *Fs) listFolders(ctx context.Context, directoryID int) (foldersList *Fol
 }
 
 func (f *Fs) listDir(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	err = f.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
@@ -213,7 +224,7 @@ func getRemote(dir, fileName string) string {
 }
 
 func (f *Fs) makeFolder(ctx context.Context, leaf string, folderID int) (response *MakeFolderResponse, err error) {
-	name := enc.FromStandardName(leaf)
+	name := f.opt.Enc.FromStandardName(leaf)
 	// fs.Debugf(f, "Creating folder `%s` in id `%s`", name, directoryID)
 
 	request := MakeFolderRequest{
@@ -320,10 +331,10 @@ func (f *Fs) getUploadNode(ctx context.Context) (response *GetUploadNodeResponse
 	return response, err
 }
 
-func (f *Fs) uploadFile(ctx context.Context, in io.Reader, size int64, fileName, folderID, uploadID, node string) (response *http.Response, err error) {
+func (f *Fs) uploadFile(ctx context.Context, in io.Reader, size int64, fileName, folderID, uploadID, node string, options ...fs.OpenOption) (response *http.Response, err error) {
 	// fs.Debugf(f, "Uploading File `%s`", fileName)
 
-	fileName = enc.FromStandardName(fileName)
+	fileName = f.opt.Enc.FromStandardName(fileName)
 
 	if len(uploadID) > 10 || !isAlphaNumeric(uploadID) {
 		return nil, errors.New("Invalid UploadID")
@@ -338,6 +349,7 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, size int64, fileName,
 		NoResponse:           true,
 		Body:                 in,
 		ContentLength:        &size,
+		Options:              options,
 		MultipartContentName: "file[]",
 		MultipartFileName:    fileName,
 		MultipartParams: map[string][]string{

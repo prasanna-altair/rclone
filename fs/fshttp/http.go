@@ -12,11 +12,11 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httputil"
-	"reflect"
 	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/structs"
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/time/rate"
 )
@@ -34,14 +34,15 @@ var (
 )
 
 // StartHTTPTokenBucket starts the token bucket if necessary
-func StartHTTPTokenBucket() {
-	if fs.Config.TPSLimit > 0 {
-		tpsBurst := fs.Config.TPSLimitBurst
+func StartHTTPTokenBucket(ctx context.Context) {
+	ci := fs.GetConfig(ctx)
+	if ci.TPSLimit > 0 {
+		tpsBurst := ci.TPSLimitBurst
 		if tpsBurst < 1 {
 			tpsBurst = 1
 		}
-		tpsBucket = rate.NewLimiter(rate.Limit(fs.Config.TPSLimit), tpsBurst)
-		fs.Infof(nil, "Starting HTTP transaction limiter: max %g transactions/s with burst %d", fs.Config.TPSLimit, tpsBurst)
+		tpsBucket = rate.NewLimiter(rate.Limit(ci.TPSLimit), tpsBurst)
+		fs.Infof(nil, "Starting HTTP transaction limiter: max %g transactions/s with burst %d", ci.TPSLimit, tpsBurst)
 	}
 }
 
@@ -92,28 +93,9 @@ func (c *timeoutConn) Write(b []byte) (n int, err error) {
 	return c.readOrWrite(c.Conn.Write, b)
 }
 
-// setDefaults for a from b
-//
-// Copy the public members from b to a.  We can't just use a struct
-// copy as Transport contains a private mutex.
-func setDefaults(a, b interface{}) {
-	pt := reflect.TypeOf(a)
-	t := pt.Elem()
-	va := reflect.ValueOf(a).Elem()
-	vb := reflect.ValueOf(b).Elem()
-	for i := 0; i < t.NumField(); i++ {
-		aField := va.Field(i)
-		// Set a from b if it is public
-		if aField.CanSet() {
-			bField := vb.Field(i)
-			aField.Set(bField)
-		}
-	}
-}
-
 // dial with context and timeouts
 func dialContextTimeout(ctx context.Context, network, address string, ci *fs.ConfigInfo) (net.Conn, error) {
-	dialer := NewDialer(ci)
+	dialer := NewDialer(ctx)
 	c, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return c, err
@@ -130,11 +112,12 @@ func ResetTransport() {
 // NewTransportCustom returns an http.RoundTripper with the correct timeouts.
 // The customize function is called if set to give the caller an opportunity to
 // customize any defaults in the Transport.
-func NewTransportCustom(ci *fs.ConfigInfo, customize func(*http.Transport)) http.RoundTripper {
+func NewTransportCustom(ctx context.Context, customize func(*http.Transport)) http.RoundTripper {
+	ci := fs.GetConfig(ctx)
 	// Start with a sensible set of defaults then override.
 	// This also means we get new stuff when it gets added to go
 	t := new(http.Transport)
-	setDefaults(t, http.DefaultTransport.(*http.Transport))
+	structs.SetDefaults(t, http.DefaultTransport.(*http.Transport))
 	t.Proxy = http.ProxyFromEnvironment
 	t.MaxIdleConnsPerHost = 2 * (ci.Checkers + ci.Transfers + 1)
 	t.MaxIdleConns = 2 * t.MaxIdleConnsPerHost
@@ -178,7 +161,14 @@ func NewTransportCustom(ci *fs.ConfigInfo, customize func(*http.Transport)) http
 		return dialContextTimeout(ctx, network, addr, ci)
 	}
 	t.IdleConnTimeout = 60 * time.Second
-	t.ExpectContinueTimeout = ci.ConnectTimeout
+	t.ExpectContinueTimeout = ci.ExpectContinueTimeout
+
+	if ci.Dump&(fs.DumpHeaders|fs.DumpBodies|fs.DumpAuth|fs.DumpRequests|fs.DumpResponses) != 0 {
+		fs.Debugf(nil, "You have specified to dump information. Please be noted that the "+
+			"Accept-Encoding as shown may not be correct in the request and the response may not show "+
+			"Content-Encoding if the go standard libraries auto gzip encoding was in effect. In this case"+
+			" the body of the request will be gunzipped before showing it.")
+	}
 
 	// customize the transport if required
 	if customize != nil {
@@ -190,17 +180,18 @@ func NewTransportCustom(ci *fs.ConfigInfo, customize func(*http.Transport)) http
 }
 
 // NewTransport returns an http.RoundTripper with the correct timeouts
-func NewTransport(ci *fs.ConfigInfo) http.RoundTripper {
+func NewTransport(ctx context.Context) http.RoundTripper {
 	(*noTransport).Do(func() {
-		transport = NewTransportCustom(ci, nil)
+		transport = NewTransportCustom(ctx, nil)
 	})
 	return transport
 }
 
 // NewClient returns an http.Client with the correct timeouts
-func NewClient(ci *fs.ConfigInfo) *http.Client {
+func NewClient(ctx context.Context) *http.Client {
+	ci := fs.GetConfig(ctx)
 	client := &http.Client{
-		Transport: NewTransport(ci),
+		Transport: NewTransport(ctx),
 	}
 	if ci.Cookie {
 		client.Jar = cookieJar
@@ -208,7 +199,7 @@ func NewClient(ci *fs.ConfigInfo) *http.Client {
 	return client
 }
 
-// Transport is a our http Transport which wraps an http.Transport
+// Transport is our http Transport which wraps an http.Transport
 // * Sets the User Agent
 // * Does logging
 type Transport struct {
@@ -216,6 +207,7 @@ type Transport struct {
 	dump          fs.DumpFlags
 	filterRequest func(req *http.Request)
 	userAgent     string
+	headers       []*fs.HTTPOption
 }
 
 // newTransport wraps the http.Transport passed in and logs all
@@ -225,6 +217,7 @@ func newTransport(ci *fs.ConfigInfo, transport *http.Transport) *Transport {
 		Transport: transport,
 		dump:      ci.Dump,
 		userAgent: ci.UserAgent,
+		headers:   ci.Headers,
 	}
 }
 
@@ -324,6 +317,10 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	}
 	// Force user agent
 	req.Header.Set("User-Agent", t.userAgent)
+	// Set user defined headers
+	for _, option := range t.headers {
+		req.Header.Set(option.Key, option.Value)
+	}
 	// Filter the request if required
 	if t.filterRequest != nil {
 		t.filterRequest(req)
@@ -361,7 +358,8 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 
 // NewDialer creates a net.Dialer structure with Timeout, Keepalive
 // and LocalAddr set from rclone flags.
-func NewDialer(ci *fs.ConfigInfo) *net.Dialer {
+func NewDialer(ctx context.Context) *net.Dialer {
+	ci := fs.GetConfig(ctx)
 	dialer := &net.Dialer{
 		Timeout:   ci.ConnectTimeout,
 		KeepAlive: 30 * time.Second,

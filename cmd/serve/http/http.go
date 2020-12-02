@@ -6,6 +6,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/cmd/serve/httplib"
@@ -31,7 +32,7 @@ var Command = &cobra.Command{
 over HTTP.  This can be viewed in a web browser or you can make a
 remote of type http read from it.
 
-You can use the filter flags (eg --include, --exclude) to control what
+You can use the filter flags (e.g. --include, --exclude) to control what
 is served.
 
 The server will log errors.  Use -v to see access logs.
@@ -131,8 +132,19 @@ func (s *server) serveDir(w http.ResponseWriter, r *http.Request, dirRemote stri
 	// Make the entries for display
 	directory := serve.NewDirectory(dirRemote, s.HTMLTemplate)
 	for _, node := range dirEntries {
-		directory.AddEntry(node.Path(), node.IsDir())
+		if vfsflags.Opt.NoModTime {
+			directory.AddHTMLEntry(node.Path(), node.IsDir(), node.Size(), time.Time{})
+		} else {
+			directory.AddHTMLEntry(node.Path(), node.IsDir(), node.Size(), node.ModTime().UTC())
+		}
 	}
+
+	sortParm := r.URL.Query().Get("sort")
+	orderParm := r.URL.Query().Get("order")
+	directory.ProcessQueryParams(sortParm, orderParm)
+
+	// Set the Last-Modified header to the timestamp
+	w.Header().Set("Last-Modified", dir.ModTime().UTC().Format(http.TimeFormat))
 
 	directory.Serve(w, r)
 }
@@ -171,6 +183,9 @@ func (s *server) serveFile(w http.ResponseWriter, r *http.Request, remote string
 		w.Header().Set("Content-Type", mimeType)
 	}
 
+	// Set the Last-Modified header to the timestamp
+	w.Header().Set("Last-Modified", file.ModTime().UTC().Format(http.TimeFormat))
+
 	// If HEAD no need to read the object since we have set the headers
 	if r.Method == "HEAD" {
 		return
@@ -191,7 +206,7 @@ func (s *server) serveFile(w http.ResponseWriter, r *http.Request, remote string
 
 	// Account the transfer
 	tr := accounting.Stats(r.Context()).NewTransfer(obj)
-	defer tr.Done(nil)
+	defer tr.Done(r.Context(), nil)
 	// FIXME in = fs.NewAccount(in, obj).WithBuffer() // account the transfer
 
 	// Serve the file

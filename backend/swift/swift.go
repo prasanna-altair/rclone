@@ -16,15 +16,16 @@ import (
 	"github.com/ncw/swift"
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
-	"github.com/rclone/rclone/fs/encodings"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/bucket"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 )
@@ -50,7 +51,7 @@ default for this is 5GB which is its maximum value.`,
 	Name: "no_chunk",
 	Help: `Don't chunk files during streaming upload.
 
-When doing streaming uploads (eg using rcat or mount) setting this
+When doing streaming uploads (e.g. using rcat or mount) setting this
 flag will cause the swift backend to not upload chunked files.
 
 This will limit the maximum upload size to 5GB. However non chunked
@@ -60,15 +61,19 @@ Rclone will still chunk files bigger than chunk_size when doing normal
 copy operations.`,
 	Default:  false,
 	Advanced: true,
+}, {
+	Name:     config.ConfigEncoding,
+	Help:     config.ConfigEncodingHelp,
+	Advanced: true,
+	Default: (encoder.EncodeInvalidUtf8 |
+		encoder.EncodeSlash),
 }}
-
-const enc = encodings.Swift
 
 // Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "swift",
-		Description: "Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)",
+		Description: "OpenStack Swift (Rackspace Cloud Files, Memset Memstore, OVH)",
 		NewFs:       NewFs,
 		Options: append([]fs.Option{{
 			Name:    "env_auth",
@@ -109,7 +114,7 @@ func init() {
 				Value: "https://auth.storage.memset.com/v2.0",
 			}, {
 				Help:  "OVH",
-				Value: "https://auth.cloud.ovh.net/v2.0",
+				Value: "https://auth.cloud.ovh.net/v3",
 			}},
 		}, {
 			Name: "user_id",
@@ -187,26 +192,27 @@ provider.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	EnvAuth                     bool          `config:"env_auth"`
-	User                        string        `config:"user"`
-	Key                         string        `config:"key"`
-	Auth                        string        `config:"auth"`
-	UserID                      string        `config:"user_id"`
-	Domain                      string        `config:"domain"`
-	Tenant                      string        `config:"tenant"`
-	TenantID                    string        `config:"tenant_id"`
-	TenantDomain                string        `config:"tenant_domain"`
-	Region                      string        `config:"region"`
-	StorageURL                  string        `config:"storage_url"`
-	AuthToken                   string        `config:"auth_token"`
-	AuthVersion                 int           `config:"auth_version"`
-	ApplicationCredentialID     string        `config:"application_credential_id"`
-	ApplicationCredentialName   string        `config:"application_credential_name"`
-	ApplicationCredentialSecret string        `config:"application_credential_secret"`
-	StoragePolicy               string        `config:"storage_policy"`
-	EndpointType                string        `config:"endpoint_type"`
-	ChunkSize                   fs.SizeSuffix `config:"chunk_size"`
-	NoChunk                     bool          `config:"no_chunk"`
+	EnvAuth                     bool                 `config:"env_auth"`
+	User                        string               `config:"user"`
+	Key                         string               `config:"key"`
+	Auth                        string               `config:"auth"`
+	UserID                      string               `config:"user_id"`
+	Domain                      string               `config:"domain"`
+	Tenant                      string               `config:"tenant"`
+	TenantID                    string               `config:"tenant_id"`
+	TenantDomain                string               `config:"tenant_domain"`
+	Region                      string               `config:"region"`
+	StorageURL                  string               `config:"storage_url"`
+	AuthToken                   string               `config:"auth_token"`
+	AuthVersion                 int                  `config:"auth_version"`
+	ApplicationCredentialID     string               `config:"application_credential_id"`
+	ApplicationCredentialName   string               `config:"application_credential_name"`
+	ApplicationCredentialSecret string               `config:"application_credential_secret"`
+	StoragePolicy               string               `config:"storage_policy"`
+	EndpointType                string               `config:"endpoint_type"`
+	ChunkSize                   fs.SizeSuffix        `config:"chunk_size"`
+	NoChunk                     bool                 `config:"no_chunk"`
+	Enc                         encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote swift server
@@ -215,6 +221,7 @@ type Fs struct {
 	root             string            // the path we are working on if any
 	features         *fs.Features      // optional features
 	opt              Options           // options for this backend
+	ci               *fs.ConfigInfo    // global config
 	c                *swift.Connection // the connection to the swift server
 	rootContainer    string            // container part of root (if any)
 	rootDirectory    string            // directory part of root (if any)
@@ -266,7 +273,7 @@ func (f *Fs) Features() *fs.Features {
 
 // retryErrorCodes is a slice of error codes that we will retry
 var retryErrorCodes = []int{
-	401, // Unauthorized (eg "Token has expired")
+	401, // Unauthorized (e.g. "Token has expired")
 	408, // Request Timeout
 	409, // Conflict - various states that could be resolved on a retry
 	429, // Rate exceeded.
@@ -278,7 +285,7 @@ var retryErrorCodes = []int{
 // shouldRetry returns a boolean as to whether this err deserves to be
 // retried.  It returns the err as a convenience
 func shouldRetry(err error) (bool, error) {
-	// If this is an swift.Error object extract the HTTP error code
+	// If this is a swift.Error object extract the HTTP error code
 	if swiftError, ok := err.(*swift.Error); ok {
 		for _, e := range retryErrorCodes {
 			if swiftError.StatusCode == e {
@@ -325,7 +332,7 @@ func parsePath(path string) (root string) {
 // relative to f.root
 func (f *Fs) split(rootRelativePath string) (container, containerPath string) {
 	container, containerPath = bucket.Split(path.Join(f.root, rootRelativePath))
-	return enc.FromStandardName(container), enc.FromStandardPath(containerPath)
+	return f.opt.Enc.FromStandardName(container), f.opt.Enc.FromStandardPath(containerPath)
 }
 
 // split returns container and containerPath from the object
@@ -334,7 +341,8 @@ func (o *Object) split() (container, containerPath string) {
 }
 
 // swiftConnection makes a connection to swift
-func swiftConnection(opt *Options, name string) (*swift.Connection, error) {
+func swiftConnection(ctx context.Context, opt *Options, name string) (*swift.Connection, error) {
+	ci := fs.GetConfig(ctx)
 	c := &swift.Connection{
 		// Keep these in the same order as the Config for ease of checking
 		UserName:                    opt.User,
@@ -353,9 +361,9 @@ func swiftConnection(opt *Options, name string) (*swift.Connection, error) {
 		ApplicationCredentialName:   opt.ApplicationCredentialName,
 		ApplicationCredentialSecret: opt.ApplicationCredentialSecret,
 		EndpointType:                swift.EndpointType(opt.EndpointType),
-		ConnectTimeout:              10 * fs.Config.ConnectTimeout, // Use the timeouts in the transport
-		Timeout:                     10 * fs.Config.Timeout,        // Use the timeouts in the transport
-		Transport:                   fshttp.NewTransport(fs.Config),
+		ConnectTimeout:              10 * ci.ConnectTimeout, // Use the timeouts in the transport
+		Timeout:                     10 * ci.Timeout,        // Use the timeouts in the transport
+		Transport:                   fshttp.NewTransport(ctx),
 	}
 	if opt.EnvAuth {
 		err := c.ApplyEnvironment()
@@ -426,13 +434,15 @@ func (f *Fs) setRoot(root string) {
 //
 // if noCheckContainer is set then the Fs won't check the container
 // exists before creating it.
-func NewFsWithConnection(opt *Options, name, root string, c *swift.Connection, noCheckContainer bool) (fs.Fs, error) {
+func NewFsWithConnection(ctx context.Context, opt *Options, name, root string, c *swift.Connection, noCheckContainer bool) (fs.Fs, error) {
+	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:             name,
 		opt:              *opt,
+		ci:               ci,
 		c:                c,
 		noCheckContainer: noCheckContainer,
-		pacer:            fs.NewPacer(pacer.NewS3(pacer.MinSleep(minSleep))),
+		pacer:            fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep))),
 		cache:            bucket.NewCache(),
 	}
 	f.setRoot(root)
@@ -441,12 +451,13 @@ func NewFsWithConnection(opt *Options, name, root string, c *swift.Connection, n
 		WriteMimeType:     true,
 		BucketBased:       true,
 		BucketBasedRootOK: true,
-	}).Fill(f)
+		SlowModTime:       true,
+	}).Fill(ctx, f)
 	if f.rootContainer != "" && f.rootDirectory != "" {
 		// Check to see if the object exists - ignoring directory markers
 		var info swift.Object
 		var err error
-		encodedDirectory := enc.FromStandardPath(f.rootDirectory)
+		encodedDirectory := f.opt.Enc.FromStandardPath(f.rootDirectory)
 		err = f.pacer.Call(func() (bool, error) {
 			var rxHeaders swift.Headers
 			info, rxHeaders, err = f.c.Object(f.rootContainer, encodedDirectory)
@@ -466,7 +477,7 @@ func NewFsWithConnection(opt *Options, name, root string, c *swift.Connection, n
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -478,11 +489,11 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, errors.Wrap(err, "swift: chunk size")
 	}
 
-	c, err := swiftConnection(opt, name)
+	c, err := swiftConnection(ctx, opt, name)
 	if err != nil {
 		return nil, err
 	}
-	return NewFsWithConnection(opt, name, root, c, false)
+	return NewFsWithConnection(ctx, opt, name, root, c, false)
 }
 
 // Return an Object from a path
@@ -498,7 +509,15 @@ func (f *Fs) newObjectWithInfo(remote string, info *swift.Object) (fs.Object, er
 	// making sure we read the full metadata for all 0 byte files.
 	// We don't read the metadata for directory marker objects.
 	if info != nil && info.Bytes == 0 && info.ContentType != "application/directory" {
-		info = nil
+		err := o.readMetaData() // reads info and headers, returning an error
+		if err == fs.ErrorObjectNotFound {
+			// We have a dangling large object here so just return the original metadata
+			fs.Errorf(o, "dangling large object with no contents")
+		} else if err != nil {
+			return nil, err
+		} else {
+			return o, nil
+		}
 	}
 	if info != nil {
 		// Set info but not headers
@@ -530,7 +549,7 @@ type listFn func(remote string, object *swift.Object, isDirectory bool) error
 // container to the start.
 //
 // Set recurse to read sub directories
-func (f *Fs) listContainerRoot(container, directory, prefix string, addContainer bool, recurse bool, fn listFn) error {
+func (f *Fs) listContainerRoot(container, directory, prefix string, addContainer bool, recurse bool, includeDirMarkers bool, fn listFn) error {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
@@ -559,12 +578,12 @@ func (f *Fs) listContainerRoot(container, directory, prefix string, addContainer
 				if !recurse {
 					isDirectory = strings.HasSuffix(object.Name, "/")
 				}
-				remote := enc.ToStandardPath(object.Name)
+				remote := f.opt.Enc.ToStandardPath(object.Name)
 				if !strings.HasPrefix(remote, prefix) {
 					fs.Logf(f, "Odd name received %q", remote)
 					continue
 				}
-				if remote == prefix {
+				if !includeDirMarkers && remote == prefix {
 					// If we have zero length directory markers ending in / then swift
 					// will return them in the listing for the directory which causes
 					// duplicate directories.  Ignore them here.
@@ -587,8 +606,8 @@ func (f *Fs) listContainerRoot(container, directory, prefix string, addContainer
 type addEntryFn func(fs.DirEntry) error
 
 // list the objects into the function supplied
-func (f *Fs) list(container, directory, prefix string, addContainer bool, recurse bool, fn addEntryFn) error {
-	err := f.listContainerRoot(container, directory, prefix, addContainer, recurse, func(remote string, object *swift.Object, isDirectory bool) (err error) {
+func (f *Fs) list(container, directory, prefix string, addContainer bool, recurse bool, includeDirMarkers bool, fn addEntryFn) error {
+	err := f.listContainerRoot(container, directory, prefix, addContainer, recurse, includeDirMarkers, func(remote string, object *swift.Object, isDirectory bool) (err error) {
 		if isDirectory {
 			remote = strings.TrimRight(remote, "/")
 			d := fs.NewDir(remote, time.Time{}).SetSize(object.Bytes)
@@ -600,7 +619,7 @@ func (f *Fs) list(container, directory, prefix string, addContainer bool, recurs
 			if err != nil {
 				return err
 			}
-			if o.Storable() {
+			if includeDirMarkers || o.Storable() {
 				err = fn(o)
 			}
 		}
@@ -618,7 +637,7 @@ func (f *Fs) listDir(container, directory, prefix string, addContainer bool) (en
 		return nil, fs.ErrorListBucketRequired
 	}
 	// List the objects
-	err = f.list(container, directory, prefix, addContainer, false, func(entry fs.DirEntry) error {
+	err = f.list(container, directory, prefix, addContainer, false, false, func(entry fs.DirEntry) error {
 		entries = append(entries, entry)
 		return nil
 	})
@@ -642,7 +661,7 @@ func (f *Fs) listContainers(ctx context.Context) (entries fs.DirEntries, err err
 	}
 	for _, container := range containers {
 		f.cache.MarkOK(container.Name)
-		d := fs.NewDir(enc.ToStandardName(container.Name), time.Time{}).SetSize(container.Bytes).SetItems(container.Count)
+		d := fs.NewDir(f.opt.Enc.ToStandardName(container.Name), time.Time{}).SetSize(container.Bytes).SetItems(container.Count)
 		entries = append(entries, d)
 	}
 	return entries, nil
@@ -688,7 +707,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	container, directory := f.split(dir)
 	list := walk.NewListRHelper(callback)
 	listR := func(container, directory, prefix string, addContainer bool) error {
-		return f.list(container, directory, prefix, addContainer, true, func(entry fs.DirEntry) error {
+		return f.list(container, directory, prefix, addContainer, true, false, func(entry fs.DirEntry) error {
 			return list.Add(entry)
 		})
 	}
@@ -825,17 +844,21 @@ func (f *Fs) Precision() time.Duration {
 	return time.Nanosecond
 }
 
-// Purge deletes all the files and directories
+// Purge deletes all the files in the directory
 //
 // Implemented here so we can make sure we delete directory markers
-func (f *Fs) Purge(ctx context.Context) error {
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	container, directory := f.split(dir)
+	if container == "" {
+		return fs.ErrorListBucketRequired
+	}
 	// Delete all the files including the directory markers
-	toBeDeleted := make(chan fs.Object, fs.Config.Transfers)
+	toBeDeleted := make(chan fs.Object, f.ci.Transfers)
 	delErr := make(chan error, 1)
 	go func() {
 		delErr <- operations.DeleteFiles(ctx, toBeDeleted)
 	}()
-	err := f.list(f.rootContainer, f.rootDirectory, f.rootDirectory, f.rootContainer == "", true, func(entry fs.DirEntry) error {
+	err := f.list(container, directory, f.rootDirectory, false, true, true, func(entry fs.DirEntry) error {
 		if o, ok := entry.(*Object); ok {
 			toBeDeleted <- o
 		}
@@ -849,10 +872,10 @@ func (f *Fs) Purge(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return f.Rmdir(ctx, "")
+	return f.Rmdir(ctx, dir)
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -1021,7 +1044,7 @@ func (o *Object) readMetaData() (err error) {
 // It attempts to read the objects mtime and if that isn't present the
 // LastModified returned in the http headers
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	if fs.Config.UseServerModTime {
+	if o.fs.ci.UseServerModTime {
 		return o.lastModified
 	}
 	err := o.readMetaData()
@@ -1096,13 +1119,18 @@ func min(x, y int64) int64 {
 //
 // if except is passed in then segments with that prefix won't be deleted
 func (o *Object) removeSegments(except string) error {
-	segmentsContainer, prefix, err := o.getSegmentsDlo()
-	err = o.fs.listContainerRoot(segmentsContainer, prefix, "", false, true, func(remote string, object *swift.Object, isDirectory bool) error {
+	segmentsContainer, _, err := o.getSegmentsDlo()
+	if err != nil {
+		return err
+	}
+	except = path.Join(o.remote, except)
+	// fs.Debugf(o, "segmentsContainer %q prefix %q", segmentsContainer, prefix)
+	err = o.fs.listContainerRoot(segmentsContainer, o.remote, "", false, true, true, func(remote string, object *swift.Object, isDirectory bool) error {
 		if isDirectory {
 			return nil
 		}
 		if except != "" && strings.HasPrefix(remote, except) {
-			// fs.Debugf(o, "Ignoring current segment file %q in container %q", segmentsRoot+remote, segmentsContainer)
+			// fs.Debugf(o, "Ignoring current segment file %q in container %q", remote, segmentsContainer)
 			return nil
 		}
 		fs.Debugf(o, "Removing segment file %q in container %q", remote, segmentsContainer)
@@ -1118,6 +1146,9 @@ func (o *Object) removeSegments(except string) error {
 	// remove the segments container if empty, ignore errors
 	err = o.fs.pacer.Call(func() (bool, error) {
 		err = o.fs.c.ContainerDelete(segmentsContainer)
+		if err == swift.ContainerNotFound || err == swift.ContainerNotEmpty {
+			return false, err
+		}
 		return shouldRetry(err)
 	})
 	if err == nil {
@@ -1247,7 +1278,7 @@ func deleteChunks(o *Object, segmentsContainer string, segmentInfos []string) {
 			fs.Debugf(o, "Delete segment file %q on %q", v, segmentsContainer)
 			e := o.fs.c.ObjectDelete(segmentsContainer, v)
 			if e != nil {
-				fs.Errorf(o, "Error occured in delete segment file %q on %q , error: %q", v, segmentsContainer, e)
+				fs.Errorf(o, "Error occurred in delete segment file %q on %q, error: %q", v, segmentsContainer, e)
 			}
 		}
 	}
@@ -1279,6 +1310,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	m.SetModTime(modTime)
 	contentType := fs.MimeType(ctx, src)
 	headers := m.ObjectHeaders()
+	fs.OpenOptionAddHeaders(options, headers)
 	uniquePrefix := ""
 	if size > int64(o.fs.opt.ChunkSize) || (size == -1 && !o.fs.opt.NoChunk) {
 		uniquePrefix, err = o.updateChunks(in, headers, size, contentType)
@@ -1307,7 +1339,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		// object has been safely uploaded
 		o.lastModified = modTime
 		o.size = size
-		o.md5 = rxHeaders["ETag"]
+		o.md5 = rxHeaders["Etag"]
 		o.contentType = contentType
 		o.headers = headers
 		if inCount != nil {

@@ -7,24 +7,31 @@ import (
 	"os"
 
 	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
 )
 
+var (
+	outputBase64 = false
+)
+
 func init() {
 	cmd.Root.AddCommand(commandDefinition)
+	cmdFlags := commandDefinition.Flags()
+	flags.BoolVarP(cmdFlags, &outputBase64, "base64", "", outputBase64, "Output base64 encoded hashsum")
 }
 
 var commandDefinition = &cobra.Command{
 	Use:   "hashsum <hash> remote:path",
-	Short: `Produces an hashsum file for all the objects in the path.`,
+	Short: `Produces a hashsum file for all the objects in the path.`,
 	Long: `
 Produces a hash file for all the objects in the path using the hash
 named.  The output is in the same format as the standard
 md5sum/sha1sum tool.
 
-Run without a hash to see the list of supported hashes, eg
+Run without a hash to see the list of supported hashes, e.g.
 
     $ rclone hashsum
     Supported hashes are:
@@ -55,6 +62,9 @@ Then
 		}
 		fsrc := cmd.NewFsSrc(args[1:])
 		cmd.Run(false, false, command, func() error {
+			if outputBase64 {
+				return operations.HashListerBase64(context.Background(), ht, fsrc, os.Stdout)
+			}
 			return operations.HashLister(context.Background(), ht, fsrc, os.Stdout)
 		})
 		return nil

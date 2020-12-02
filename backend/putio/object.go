@@ -115,7 +115,7 @@ func (o *Object) MimeType(ctx context.Context) string {
 
 // setMetadataFromEntry sets the fs data from a putio.File
 //
-// This isn't a complete set of metadata and has an inacurate date
+// This isn't a complete set of metadata and has an inaccurate date
 func (o *Object) setMetadataFromEntry(info putio.File) error {
 	o.file = &info
 	o.modtime = info.UpdatedAt.Time
@@ -125,7 +125,7 @@ func (o *Object) setMetadataFromEntry(info putio.File) error {
 // Reads the entry for a file from putio
 func (o *Object) readEntry(ctx context.Context) (f *putio.File, err error) {
 	// defer log.Trace(o, "")("f=%+v, err=%v", f, &err)
-	leaf, directoryID, err := o.fs.dirCache.FindRootAndPath(ctx, o.remote, false)
+	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
 	if err != nil {
 		if err == fs.ErrorDirNotFound {
 			return nil, fs.ErrorObjectNotFound
@@ -137,7 +137,7 @@ func (o *Object) readEntry(ctx context.Context) (f *putio.File, err error) {
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		// fs.Debugf(o, "requesting child. directoryID: %s, name: %s", directoryID, leaf)
-		req, err := o.fs.client.NewRequest(ctx, "GET", "/v2/files/"+directoryID+"/child?name="+url.QueryEscape(enc.FromStandardName(leaf)), nil)
+		req, err := o.fs.client.NewRequest(ctx, "GET", "/v2/files/"+directoryID+"/child?name="+url.QueryEscape(o.fs.opt.Enc.FromStandardName(leaf)), nil)
 		if err != nil {
 			return false, err
 		}
@@ -241,14 +241,17 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			req.Header.Set(header, value)
 		}
 		// fs.Debugf(o, "opening file: id=%d", o.file.ID)
-		resp, err = http.DefaultClient.Do(req)
+		resp, err = o.fs.httpClient.Do(req)
 		return shouldRetry(err)
 	})
 	if perr, ok := err.(*putio.ErrorResponse); ok && perr.Response.StatusCode >= 400 && perr.Response.StatusCode <= 499 {
 		_ = resp.Body.Close()
 		return nil, fserrors.NoRetryError(err)
 	}
-	return resp.Body, err
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
 // Update the already existing object

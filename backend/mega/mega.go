@@ -11,7 +11,7 @@ Improvements:
 * Uploads could be done in parallel
 * Downloads would be more efficient done in one go
 * Uploads would be more efficient with bigger chunks
-* Looks like mega can support server side copy, but it isn't implemented in go-mega
+* Looks like mega can support server-side copy, but it isn't implemented in go-mega
 * Upload can set modtime... - set as int64_t - can set ctime and mtime?
 */
 
@@ -26,18 +26,17 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
-	"github.com/rclone/rclone/fs/encodings"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 	mega "github.com/t3rm1n4l/go-mega"
 )
-
-const enc = encodings.Mega
 
 const (
 	minSleep      = 10 * time.Millisecond
@@ -83,16 +82,24 @@ than permanently deleting them.  If you specify this then rclone will
 permanently delete objects instead.`,
 			Default:  false,
 			Advanced: true,
+		}, {
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
+			Advanced: true,
+			// Encode invalid UTF-8 bytes as json doesn't handle them properly.
+			Default: (encoder.Base |
+				encoder.EncodeInvalidUtf8),
 		}},
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	User       string `config:"user"`
-	Pass       string `config:"pass"`
-	Debug      bool   `config:"debug"`
-	HardDelete bool   `config:"hard_delete"`
+	User       string               `config:"user"`
+	Pass       string               `config:"pass"`
+	Debug      bool                 `config:"debug"`
+	HardDelete bool                 `config:"hard_delete"`
+	Enc        encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote mega
@@ -143,7 +150,7 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// parsePath parses an mega 'url'
+// parsePath parses a mega 'url'
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
 	return
@@ -173,7 +180,7 @@ func (f *Fs) readMetaDataForPath(remote string) (info *mega.Node, err error) {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -187,6 +194,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 			return nil, errors.Wrap(err, "couldn't decrypt password")
 		}
 	}
+	ci := fs.GetConfig(ctx)
 
 	// cache *mega.Mega on username so we can re-use and share
 	// them between remotes.  They are expensive to make as they
@@ -197,8 +205,8 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	defer megaCacheMu.Unlock()
 	srv := megaCache[opt.User]
 	if srv == nil {
-		srv = mega.New().SetClient(fshttp.NewClient(fs.Config))
-		srv.SetRetries(fs.Config.LowLevelRetries) // let mega do the low level retries
+		srv = mega.New().SetClient(fshttp.NewClient(ctx))
+		srv.SetRetries(ci.LowLevelRetries) // let mega do the low level retries
 		srv.SetLogger(func(format string, v ...interface{}) {
 			fs.Infof("*go-mega*", format, v...)
 		})
@@ -221,12 +229,12 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		root:  root,
 		opt:   *opt,
 		srv:   srv,
-		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
 		CanHaveEmptyDirectories: true,
-	}).Fill(f)
+	}).Fill(ctx, f)
 
 	// Find the root node and check if it is a file or not
 	_, err = f.findRoot(false)
@@ -250,12 +258,12 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 // splitNodePath splits nodePath into / separated parts, returning nil if it
 // should refer to the root.
 // It also encodes the parts into backend specific encoding
-func splitNodePath(nodePath string) (parts []string) {
+func (f *Fs) splitNodePath(nodePath string) (parts []string) {
 	nodePath = path.Clean(nodePath)
 	if nodePath == "." || nodePath == "/" {
 		return nil
 	}
-	nodePath = enc.FromStandardPath(nodePath)
+	nodePath = f.opt.Enc.FromStandardPath(nodePath)
 	return strings.Split(nodePath, "/")
 }
 
@@ -263,7 +271,7 @@ func splitNodePath(nodePath string) (parts []string) {
 //
 // It returns mega.ENOENT if it wasn't found
 func (f *Fs) findNode(rootNode *mega.Node, nodePath string) (*mega.Node, error) {
-	parts := splitNodePath(nodePath)
+	parts := f.splitNodePath(nodePath)
 	if parts == nil {
 		return rootNode, nil
 	}
@@ -320,7 +328,7 @@ func (f *Fs) mkdir(rootNode *mega.Node, dir string) (node *mega.Node, err error)
 	f.mkdirMu.Lock()
 	defer f.mkdirMu.Unlock()
 
-	parts := splitNodePath(dir)
+	parts := f.splitNodePath(dir)
 	if parts == nil {
 		return rootNode, nil
 	}
@@ -422,7 +430,7 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 	errors := 0
 	// similar to f.deleteNode(trash) but with HardDelete as true
 	for _, item := range items {
-		fs.Debugf(f, "Deleting trash %q", enc.ToStandardName(item.GetName()))
+		fs.Debugf(f, "Deleting trash %q", f.opt.Enc.ToStandardName(item.GetName()))
 		deleteErr := f.pacer.Call(func() (bool, error) {
 			err := f.srv.Delete(item, true)
 			return shouldRetry(err)
@@ -504,7 +512,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 	var iErr error
 	_, err = f.list(ctx, dirNode, func(info *mega.Node) bool {
-		remote := path.Join(dir, enc.ToStandardName(info.GetName()))
+		remote := path.Join(dir, f.opt.Enc.ToStandardName(info.GetName()))
 		switch info.GetType() {
 		case mega.FOLDER, mega.ROOT, mega.INBOX, mega.TRASH:
 			d := fs.NewDir(remote, info.GetTimeStamp()).SetID(info.GetHash())
@@ -662,13 +670,13 @@ func (f *Fs) Precision() time.Duration {
 	return fs.ModTimeNotSupported
 }
 
-// Purge deletes all the files and the container
+// Purge deletes all the files in the directory
 //
 // Optional interface: Only implement this if you have a way of
 // deleting all the files quicker than just running Remove() on the
 // result of List()
-func (f *Fs) Purge(ctx context.Context) error {
-	return f.purgeCheck("", false)
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(dir, false)
 }
 
 // move a file or folder (srcFs, srcRemote, info) to (f, dstRemote)
@@ -692,7 +700,7 @@ func (f *Fs) move(dstRemote string, srcFs *Fs, srcRemote string, info *mega.Node
 		dstDirNode, err = dstFs.mkdir(absRoot, dstParent)
 	}
 	if err != nil {
-		return errors.Wrap(err, "server side move failed to make dst parent dir")
+		return errors.Wrap(err, "server-side move failed to make dst parent dir")
 	}
 
 	if srcRemote != "" {
@@ -705,7 +713,7 @@ func (f *Fs) move(dstRemote string, srcFs *Fs, srcRemote string, info *mega.Node
 		srcDirNode, err = f.findDir(absRoot, srcParent)
 	}
 	if err != nil {
-		return errors.Wrap(err, "server side move failed to lookup src parent dir")
+		return errors.Wrap(err, "server-side move failed to lookup src parent dir")
 	}
 
 	// move the object into its new directory if required
@@ -716,7 +724,7 @@ func (f *Fs) move(dstRemote string, srcFs *Fs, srcRemote string, info *mega.Node
 			return shouldRetry(err)
 		})
 		if err != nil {
-			return errors.Wrap(err, "server side move failed")
+			return errors.Wrap(err, "server-side move failed")
 		}
 	}
 
@@ -726,11 +734,11 @@ func (f *Fs) move(dstRemote string, srcFs *Fs, srcRemote string, info *mega.Node
 	if srcLeaf != dstLeaf {
 		//log.Printf("rename %q to %q", srcLeaf, dstLeaf)
 		err = f.pacer.Call(func() (bool, error) {
-			err = f.srv.Rename(info, enc.FromStandardName(dstLeaf))
+			err = f.srv.Rename(info, f.opt.Enc.FromStandardName(dstLeaf))
 			return shouldRetry(err)
 		})
 		if err != nil {
-			return errors.Wrap(err, "server side rename failed")
+			return errors.Wrap(err, "server-side rename failed")
 		}
 	}
 
@@ -739,7 +747,7 @@ func (f *Fs) move(dstRemote string, srcFs *Fs, srcRemote string, info *mega.Node
 	return nil
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -774,7 +782,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -829,7 +837,7 @@ func (f *Fs) Hashes() hash.Set {
 }
 
 // PublicLink generates a public link to the remote path (usually readable by anyone)
-func (f *Fs) PublicLink(ctx context.Context, remote string) (link string, err error) {
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (link string, err error) {
 	root, err := f.findRoot(false)
 	if err != nil {
 		return "", errors.Wrap(err, "PublicLink failed to find root node")
@@ -864,7 +872,7 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 			return errors.Errorf("MergeDirs failed to find node for: %v", srcDir)
 		}
 
-		// list the the objects
+		// list the objects
 		infos := []*mega.Node{}
 		_, err := f.list(ctx, srcDirNode, func(info *mega.Node) bool {
 			infos = append(infos, info)
@@ -875,13 +883,13 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 		}
 		// move them into place
 		for _, info := range infos {
-			fs.Infof(srcDir, "merging %q", enc.ToStandardName(info.GetName()))
+			fs.Infof(srcDir, "merging %q", f.opt.Enc.ToStandardName(info.GetName()))
 			err = f.pacer.Call(func() (bool, error) {
 				err = f.srv.Move(info, dstDirNode)
 				return shouldRetry(err)
 			})
 			if err != nil {
-				return errors.Wrapf(err, "MergeDirs move failed on %q in %v", enc.ToStandardName(info.GetName()), srcDir)
+				return errors.Wrapf(err, "MergeDirs move failed on %q in %v", f.opt.Enc.ToStandardName(info.GetName()), srcDir)
 			}
 		}
 		// rmdir (into trash) the now empty source directory
@@ -1124,7 +1132,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	var u *mega.Upload
 	err = o.fs.pacer.Call(func() (bool, error) {
-		u, err = o.fs.srv.NewUpload(dirNode, enc.FromStandardName(leaf), size)
+		u, err = o.fs.srv.NewUpload(dirNode, o.fs.opt.Enc.FromStandardName(leaf), size)
 		return shouldRetry(err)
 	})
 	if err != nil {

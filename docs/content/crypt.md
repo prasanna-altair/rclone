@@ -1,29 +1,31 @@
 ---
 title: "Crypt"
 description: "Encryption overlay remote"
-date: "2016-07-28"
 ---
 
-<i class="fa fa-lock"></i>Crypt
+{{< icon "fa fa-lock" >}}Crypt
 ----------------------------------------
 
-The `crypt` remote encrypts and decrypts another remote.
+Rclone `crypt` remotes encrypt and decrypt other remotes.
 
-To use it first set up the underlying remote following the config
-instructions for that remote.  You can also use a local pathname
-instead of a remote which will encrypt and decrypt from that directory
-which might be useful for encrypting onto a USB stick for example.
+To use `crypt`, first set up the underlying remote. Follow the `rclone
+config` instructions for that remote.
 
-First check your chosen remote is working - we'll call it
-`remote:path` in these docs.  Note that anything inside `remote:path`
-will be encrypted and anything outside won't.  This means that if you
-are using a bucket based remote (eg S3, B2, swift) then you should
-probably put the bucket in the remote `s3:bucket`. If you just use
-`s3:` then rclone will make encrypted bucket names too (if using file
-name encryption) which may or may not be what you want.
+`crypt` applied to a local pathname instead of a remote will
+encrypt and decrypt that directory, and can be used to encrypt USB
+removable drives.
 
-Now configure `crypt` using `rclone config`. We will call this one
-`secret` to differentiate it from the `remote`.
+Before configuring the crypt remote, check the underlying remote is
+working. In this example the underlying remote is called `remote:path`.
+Anything inside `remote:path` will be encrypted and anything outside
+will not. In the case of an S3 based underlying remote (e.g. Amazon S3,
+B2, Swift) it is generally advisable to define a crypt remote in the
+underlying remote `s3:bucket`. If `s3:` alone is specified alongside
+file name encryption, rclone will encrypt the bucket name.
+
+Configure `crypt` using `rclone config`. In this example the `crypt`
+remote is called `secret`, to differentiate it from the underlying
+`remote`.
 
 ```
 No remotes found - make a new one
@@ -40,7 +42,7 @@ XX / Encrypt/Decrypt a remote
 [snip]
 Storage> crypt
 Remote to encrypt/decrypt.
-Normally should contain a ':' and a path, eg "myremote:path/to/dir",
+Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 "myremote:bucket" or maybe "myremote:" (not recommended).
 remote> remote:path
 How to encrypt the filenames.
@@ -97,44 +99,42 @@ d) Delete this remote
 y/e/d> y
 ```
 
-**Important** The password is stored in the config file is lightly
-obscured so it isn't immediately obvious what it is.  It is in no way
-secure unless you use config file encryption.
+**Important** The crypt password stored in `rclone.conf` is lightly
+obscured. That only protects it from cursory inspection. It is not
+secure unless encryption of `rclone.conf` is specified.
 
-A long passphrase is recommended, or you can use a random one.  Note
-that if you reconfigure rclone with the same passwords/passphrases
-elsewhere it will be compatible - all the secrets used are derived
-from those two passwords/passphrases.
+A long passphrase is recommended, or `rclone config` can generate a
+random one.
 
-Note that rclone does not encrypt
+The obscured password is created using AES-CTR with a static key. The
+salt is stored verbatim at the beginning of the obscured password. This
+static key is shared between all versions of rclone.
 
-  * file length - this can be calcuated within 16 bytes
+If you reconfigure rclone with the same passwords/passphrases
+elsewhere it will be compatible, but the obscured version will be different
+due to the different salt.
+
+Rclone does not encrypt
+
+  * file length - this can be calculated within 16 bytes
   * modification time - used for syncing
 
 ## Specifying the remote ##
 
-In normal use, make sure the remote has a `:` in. If you specify the
-remote without a `:` then rclone will use a local directory of that
-name.  So if you use a remote of `/path/to/secret/files` then rclone
-will encrypt stuff to that directory.  If you use a remote of `name`
-then rclone will put files in a directory called `name` in the current
-directory.
+In normal use, ensure the remote has a `:` in. If specified without,
+rclone uses a local directory of that name.  For example if a remote
+`/path/to/secret/files` is specified, rclone encrypts content to that
+directory.  If a remote `name` is specified, rclone targets a directory
+`name` in the current directory.
 
-If you specify the remote as `remote:path/to/dir` then rclone will
-store encrypted files in `path/to/dir` on the remote. If you are using
-file name encryption, then when you save files to
-`secret:subdir/subfile` this will store them in the unencrypted path
-`path/to/dir` but the `subdir/subpath` bit will be encrypted.
-
-Note that unless you want encrypted bucket names (which are difficult
-to manage because you won't know what directory they represent in web
-interfaces etc), you should probably specify a bucket, eg
-`remote:secretbucket` when using bucket based remotes such as S3,
-Swift, Hubic, B2, GCS.
+If remote `remote:path/to/dir` is specified, rclone stores encrypted
+files in `path/to/dir` on the remote. With file name encryption, files
+saved to `secret:subdir/subfile` are stored in the unencrypted path
+`path/to/dir` but the `subdir/subpath` element is encrypted.
 
 ## Example ##
 
-To test I made a little directory of files using "standard" file name
+Create the following file structure using "standard" file name
 encryption.
 
 ```
@@ -148,7 +148,7 @@ plaintext/
         └── file4.txt
 ```
 
-Copy these to the remote and list them back
+Copy these to the remote, and list them
 
 ```
 $ rclone -q copy plaintext secret:
@@ -160,7 +160,7 @@ $ rclone -q ls secret:
         9 subdir/file3.txt
 ```
 
-Now see what that looked like when encrypted
+The crypt remote looks like
 
 ```
 $ rclone -q ls remote:path
@@ -171,7 +171,7 @@ $ rclone -q ls remote:path
        56 86vhrsv86mpbtd3a0akjuqslj8/8njh1sk437gttmep3p70g81aps
 ```
 
-Note that this retains the directory structure which means you can do this
+The directory structure is preserved
 
 ```
 $ rclone -q ls secret:subdir
@@ -180,9 +180,9 @@ $ rclone -q ls secret:subdir
        10 subsubdir/file4.txt
 ```
 
-If don't use file name encryption then the remote will look like this
-- note the `.bin` extensions added to prevent the cloud provider
-attempting to interpret the data.
+Without file name encryption `.bin` extensions are added to underlying
+names. This prevents the cloud provider attempting to interpret file
+content.
 
 ```
 $ rclone -q ls remote:path
@@ -194,8 +194,6 @@ $ rclone -q ls remote:path
 ```
 
 ### File name encryption modes ###
-
-Here are some of the features of the file name encryption modes
 
 Off
 
@@ -215,17 +213,19 @@ Standard
 Obfuscation
 
 This is a simple "rotate" of the filename, with each file having a rot
-distance based on the filename. We store the distance at the beginning
-of the filename. So a file called "hello" may become "53.jgnnq"
+distance based on the filename. Rclone stores the distance at the
+beginning of the filename. A file called "hello" may become "53.jgnnq".
 
-This is not a strong encryption of filenames, but it may stop automated
-scanning tools from picking up on filename patterns. As such it's an
-intermediate between "off" and "standard". The advantage is that it
-allows for longer path segment names.
+Obfuscation is not a strong encryption of filenames, but hinders
+automated scanning tools picking up on filename patterns. It is an
+intermediate between "off" and "standard" which allows for longer path
+segment names.
 
 There is a possibility with some unicode based filenames that the
 obfuscation is weak and may map lower case characters to upper case
-equivalents.  You can not rely on this for strong protection.
+equivalents. 
+
+Obfuscation cannot be relied upon for strong protection.
 
   * file names very lightly obfuscated
   * file names can be longer than standard encryption
@@ -233,13 +233,14 @@ equivalents.  You can not rely on this for strong protection.
   * directory structure visible
   * identical files names will have identical uploaded names
 
-Cloud storage systems have various limits on file name length and
-total path length which you are more likely to hit using "Standard"
-file name encryption.  If you keep your file names to below 156
-characters in length then you should be OK on all providers.
+Cloud storage systems have limits on file name length and
+total path length which rclone is more likely to breach using
+"Standard" file name encryption.  Where file names are less thn 156
+characters in length issues should not be encountered, irrespective of
+cloud storage provider.
 
-There may be an even more secure file name encryption mode in the
-future which will address the long file name problem.
+An alternative, future rclone file name encryption mode may tolerate
+backend provider path length limits.
 
 ### Directory name encryption ###
 Crypt offers the option of encrypting dir names or leaving them intact.
@@ -265,14 +266,14 @@ Example:
 Crypt stores modification times using the underlying remote so support
 depends on that.
 
-Hashes are not stored for crypt.  However the data integrity is
+Hashes are not stored for crypt. However the data integrity is
 protected by an extremely strong crypto authenticator.
 
-Note that you should use the `rclone cryptcheck` command to check the
+Use the `rclone cryptcheck` command to check the
 integrity of a crypted remote instead of `rclone check` which can't
 check the checksums properly.
 
-<!--- autogenerated options start - DO NOT EDIT, instead edit fs.RegInfo in backend/crypt/crypt.go then run make backenddocs -->
+{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/crypt/crypt.go then run make backenddocs" >}}
 ### Standard Options
 
 Here are the standard options specific to crypt (Encrypt/Decrypt a remote).
@@ -280,7 +281,7 @@ Here are the standard options specific to crypt (Encrypt/Decrypt a remote).
 #### --crypt-remote
 
 Remote to encrypt/decrypt.
-Normally should contain a ':' and a path, eg "myremote:path/to/dir",
+Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 "myremote:bucket" or maybe "myremote:" (not recommended).
 
 - Config:      remote
@@ -297,16 +298,18 @@ How to encrypt the filenames.
 - Type:        string
 - Default:     "standard"
 - Examples:
-    - "off"
-        - Don't encrypt the file names.  Adds a ".bin" extension only.
     - "standard"
         - Encrypt the filenames see the docs for the details.
     - "obfuscate"
         - Very simple filename obfuscation.
+    - "off"
+        - Don't encrypt the file names.  Adds a ".bin" extension only.
 
 #### --crypt-directory-name-encryption
 
 Option to either encrypt directory names or leave them intact.
+
+NB If filename_encryption is "off" then this option will do nothing.
 
 - Config:      directory_name_encryption
 - Env Var:     RCLONE_CRYPT_DIRECTORY_NAME_ENCRYPTION
@@ -322,6 +325,8 @@ Option to either encrypt directory names or leave them intact.
 
 Password or pass phrase for encryption.
 
+**NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
+
 - Config:      password
 - Env Var:     RCLONE_CRYPT_PASSWORD
 - Type:        string
@@ -332,6 +337,8 @@ Password or pass phrase for encryption.
 Password or pass phrase for salt. Optional but recommended.
 Should be different to the previous password.
 
+**NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
+
 - Config:      password2
 - Env Var:     RCLONE_CRYPT_PASSWORD2
 - Type:        string
@@ -340,6 +347,24 @@ Should be different to the previous password.
 ### Advanced Options
 
 Here are the advanced options specific to crypt (Encrypt/Decrypt a remote).
+
+#### --crypt-server-side-across-configs
+
+Allow server-side operations (e.g. copy) to work across different crypt configs.
+
+Normally this option is not what you want, but if you have two crypts
+pointing to the same backend you can use it.
+
+This can be used, for example, to change file name encryption type
+without re-uploading all the data. Just make two crypt backends
+pointing to two different directories with the single changed
+parameter and use rclone move to move the files between the crypt
+remotes.
+
+- Config:      server_side_across_configs
+- Env Var:     RCLONE_CRYPT_SERVER_SIDE_ACROSS_CONFIGS
+- Type:        bool
+- Default:     false
 
 #### --crypt-show-mapping
 
@@ -358,11 +383,58 @@ names, or for debugging purposes.
 - Type:        bool
 - Default:     false
 
-<!--- autogenerated options stop -->
+### Backend commands
+
+Here are the commands specific to the crypt backend.
+
+Run them with
+
+    rclone backend COMMAND remote:
+
+The help below will explain what arguments each command takes.
+
+See [the "rclone backend" command](/commands/rclone_backend/) for more
+info on how to pass options and arguments.
+
+These can be run on a running backend using the rc command
+[backend/command](/rc/#backend/command).
+
+#### encode
+
+Encode the given filename(s)
+
+    rclone backend encode remote: [options] [<arguments>+]
+
+This encodes the filenames given as arguments returning a list of
+strings of the encoded results.
+
+Usage Example:
+
+    rclone backend encode crypt: file1 [file2...]
+    rclone rc backend/command command=encode fs=crypt: file1 [file2...]
+
+
+#### decode
+
+Decode the given filename(s)
+
+    rclone backend decode remote: [options] [<arguments>+]
+
+This decodes the filenames given as arguments returning a list of
+strings of the decoded results. It will return an error if any of the
+inputs are invalid.
+
+Usage Example:
+
+    rclone backend decode crypt: encryptedfile1 [encryptedfile2...]
+    rclone rc backend/command command=decode fs=crypt: encryptedfile1 [encryptedfile2...]
+
+
+{{< rem autogenerated options stop >}}
 
 ## Backing up a crypted remote ##
 
-If you wish to backup a crypted remote, it it recommended that you use
+If you wish to backup a crypted remote, it is recommended that you use
 `rclone sync` on the encrypted files, and make sure the passwords are
 the same in the new encrypted remote.
 
@@ -380,7 +452,7 @@ as `eremote:`.
 
 To sync the two remotes you would do
 
-    rclone sync remote:crypt remote2:crypt
+    rclone sync -i remote:crypt remote2:crypt
 
 And to check the integrity you would do
 
@@ -446,7 +518,7 @@ files.
 File names are encrypted segment by segment - the path is broken up
 into `/` separated strings and these are encrypted individually.
 
-File segments are padded using using PKCS#7 to a multiple of 16 bytes
+File segments are padded using PKCS#7 to a multiple of 16 bytes
 before encryption.
 
 They are then encrypted with EME using AES with 256 bit key. EME
@@ -473,7 +545,7 @@ encoding is modified in two ways:
   * we strip the padding character `=`
 
 `base32` is used rather than the more efficient `base64` so rclone can be
-used on case insensitive remotes (eg Windows, Amazon Drive).
+used on case insensitive remotes (e.g. Windows, Amazon Drive).
 
 ### Key derivation ###
 

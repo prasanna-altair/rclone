@@ -1,9 +1,11 @@
 package fs
 
 import (
+	"context"
 	"fmt"
 	"log"
 
+	sysdjournald "github.com/iguanesolutions/go-systemd/v5/journald"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -70,20 +72,67 @@ func (l *LogLevel) Type() string {
 
 // LogPrint sends the text to the logger of level
 var LogPrint = func(level LogLevel, text string) {
-	text = fmt.Sprintf("%-6s: %s", level, text)
+	var prefix string
+	if GetConfig(context.TODO()).LogSystemdSupport {
+		switch level {
+		case LogLevelDebug:
+			prefix = sysdjournald.DebugPrefix
+		case LogLevelInfo:
+			prefix = sysdjournald.InfoPrefix
+		case LogLevelNotice:
+			prefix = sysdjournald.NoticePrefix
+		case LogLevelWarning:
+			prefix = sysdjournald.WarningPrefix
+		case LogLevelError:
+			prefix = sysdjournald.ErrPrefix
+		case LogLevelCritical:
+			prefix = sysdjournald.CritPrefix
+		case LogLevelAlert:
+			prefix = sysdjournald.AlertPrefix
+		case LogLevelEmergency:
+			prefix = sysdjournald.EmergPrefix
+		}
+	}
+	text = fmt.Sprintf("%s%-6s: %s", prefix, level, text)
 	_ = log.Output(4, text)
+}
+
+// LogValueItem describes keyed item for a JSON log entry
+type LogValueItem struct {
+	key   string
+	value interface{}
+}
+
+// LogValue should be used as an argument to any logging calls to
+// augment the JSON output with more structured information.
+//
+// key is the dictionary parameter used to store value.
+func LogValue(key string, value interface{}) LogValueItem {
+	return LogValueItem{key: key, value: value}
+}
+
+// String returns an empty string so LogValueItem entries won't show
+// in the textual representation of logs. They need to be put in so
+// the number of parameters of the log call matches.
+func (j LogValueItem) String() string {
+	return ""
 }
 
 // LogPrintf produces a log string from the arguments passed in
 func LogPrintf(level LogLevel, o interface{}, text string, args ...interface{}) {
 	out := fmt.Sprintf(text, args...)
 
-	if Config.UseJSONLog {
+	if GetConfig(context.TODO()).UseJSONLog {
 		fields := logrus.Fields{}
 		if o != nil {
 			fields = logrus.Fields{
 				"object":     fmt.Sprintf("%+v", o),
 				"objectType": fmt.Sprintf("%T", o),
+			}
+		}
+		for _, arg := range args {
+			if item, ok := arg.(LogValueItem); ok {
+				fields[item.key] = item.value
 			}
 		}
 		switch level {
@@ -110,7 +159,7 @@ func LogPrintf(level LogLevel, o interface{}, text string, args ...interface{}) 
 
 // LogLevelPrintf writes logs at the given level
 func LogLevelPrintf(level LogLevel, o interface{}, text string, args ...interface{}) {
-	if Config.LogLevel >= level {
+	if GetConfig(context.TODO()).LogLevel >= level {
 		LogPrintf(level, o, text, args...)
 	}
 }
@@ -118,7 +167,7 @@ func LogLevelPrintf(level LogLevel, o interface{}, text string, args ...interfac
 // Errorf writes error log output for this Object or Fs.  It
 // should always be seen by the user.
 func Errorf(o interface{}, text string, args ...interface{}) {
-	if Config.LogLevel >= LogLevelError {
+	if GetConfig(context.TODO()).LogLevel >= LogLevelError {
 		LogPrintf(LogLevelError, o, text, args...)
 	}
 }
@@ -129,7 +178,7 @@ func Errorf(o interface{}, text string, args ...interface{}) {
 // important things the user should see.  The user can filter these
 // out with the -q flag.
 func Logf(o interface{}, text string, args ...interface{}) {
-	if Config.LogLevel >= LogLevelNotice {
+	if GetConfig(context.TODO()).LogLevel >= LogLevelNotice {
 		LogPrintf(LogLevelNotice, o, text, args...)
 	}
 }
@@ -138,7 +187,7 @@ func Logf(o interface{}, text string, args ...interface{}) {
 // level for logging transfers, deletions and things which should
 // appear with the -v flag.
 func Infof(o interface{}, text string, args ...interface{}) {
-	if Config.LogLevel >= LogLevelInfo {
+	if GetConfig(context.TODO()).LogLevel >= LogLevelInfo {
 		LogPrintf(LogLevelInfo, o, text, args...)
 	}
 }
@@ -146,7 +195,7 @@ func Infof(o interface{}, text string, args ...interface{}) {
 // Debugf writes debugging output for this Object or Fs.  Use this for
 // debug only.  The user must have to specify -vv to see this.
 func Debugf(o interface{}, text string, args ...interface{}) {
-	if Config.LogLevel >= LogLevelDebug {
+	if GetConfig(context.TODO()).LogLevel >= LogLevelDebug {
 		LogPrintf(LogLevelDebug, o, text, args...)
 	}
 }

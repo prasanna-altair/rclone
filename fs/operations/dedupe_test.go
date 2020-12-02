@@ -75,6 +75,29 @@ func TestDeduplicateSkip(t *testing.T) {
 	r.CheckWithDuplicates(t, file1, file3)
 }
 
+func TestDeduplicateSizeOnly(t *testing.T) {
+	r := fstest.NewRun(t)
+	defer r.Finalise()
+	skipIfCantDedupe(t, r.Fremote)
+	ctx := context.Background()
+	ci := fs.GetConfig(ctx)
+
+	file1 := r.WriteUncheckedObject(context.Background(), "one", "This is one", t1)
+	file2 := r.WriteUncheckedObject(context.Background(), "one", "THIS IS ONE", t1)
+	file3 := r.WriteUncheckedObject(context.Background(), "one", "This is another one", t1)
+	r.CheckWithDuplicates(t, file1, file2, file3)
+
+	ci.SizeOnly = true
+	defer func() {
+		ci.SizeOnly = false
+	}()
+
+	err := operations.Deduplicate(context.Background(), r.Fremote, operations.DeduplicateSkip)
+	require.NoError(t, err)
+
+	r.CheckWithDuplicates(t, file1, file3)
+}
+
 func TestDeduplicateFirst(t *testing.T) {
 	r := fstest.NewRun(t)
 	defer r.Finalise()
@@ -150,6 +173,22 @@ func TestDeduplicateLargest(t *testing.T) {
 	require.NoError(t, err)
 
 	fstest.CheckItems(t, r.Fremote, file3)
+}
+
+func TestDeduplicateSmallest(t *testing.T) {
+	r := fstest.NewRun(t)
+	defer r.Finalise()
+	skipIfCantDedupe(t, r.Fremote)
+
+	file1 := r.WriteUncheckedObject(context.Background(), "one", "This is one", t1)
+	file2 := r.WriteUncheckedObject(context.Background(), "one", "This is one too", t2)
+	file3 := r.WriteUncheckedObject(context.Background(), "one", "This is another one", t3)
+	r.CheckWithDuplicates(t, file1, file2, file3)
+
+	err := operations.Deduplicate(context.Background(), r.Fremote, operations.DeduplicateSmallest)
+	require.NoError(t, err)
+
+	fstest.CheckItems(t, r.Fremote, file1)
 }
 
 func TestDeduplicateRename(t *testing.T) {

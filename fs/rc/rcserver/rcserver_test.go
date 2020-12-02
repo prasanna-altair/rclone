@@ -2,6 +2,7 @@ package rcserver
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -12,14 +13,17 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/rclone/rclone/backend/local"
-	"github.com/rclone/rclone/fs/rc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	_ "github.com/rclone/rclone/backend/local"
+	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/rc"
 )
 
 const (
 	testBindAddress = "localhost:0"
+	testTemplate    = "testdata/golden/testindex.html"
 	testFs          = "testdata/files"
 	remoteURL       = "[" + testFs + "]/" // initial URL path to fetch from that remote
 )
@@ -29,11 +33,12 @@ const (
 func TestRcServer(t *testing.T) {
 	opt := rc.DefaultOpt
 	opt.HTTPOptions.ListenAddr = testBindAddress
+	opt.HTTPOptions.Template = testTemplate
 	opt.Enabled = true
 	opt.Serve = true
 	opt.Files = testFs
 	mux := http.NewServeMux()
-	rcServer := newServer(&opt, mux)
+	rcServer := newServer(context.Background(), &opt, mux)
 	assert.NoError(t, rcServer.Serve())
 	defer func() {
 		rcServer.Close()
@@ -80,7 +85,8 @@ type testRun struct {
 // Run a suite of tests
 func testServer(t *testing.T, tests []testRun, opt *rc.Options) {
 	mux := http.NewServeMux()
-	rcServer := newServer(opt, mux)
+	opt.HTTPOptions.Template = testTemplate
+	rcServer := newServer(context.Background(), opt, mux)
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
 			method := test.Method
@@ -481,7 +487,60 @@ func TestMethods(t *testing.T) {
 	testServer(t, tests, &opt)
 }
 
-var matchRemoteDirListing = regexp.MustCompile(`<title>List of all rclone remotes.</title>`)
+func TestMetrics(t *testing.T) {
+	stats := accounting.GlobalStats()
+	tests := makeMetricsTestCases(stats)
+	opt := newTestOpt()
+	opt.EnableMetrics = true
+	testServer(t, tests, &opt)
+
+	// Test changing a couple options
+	stats.Bytes(500)
+	stats.Deletes(30)
+	stats.Errors(2)
+	stats.Bytes(324)
+
+	tests = makeMetricsTestCases(stats)
+	testServer(t, tests, &opt)
+}
+
+func makeMetricsTestCases(stats *accounting.StatsInfo) (tests []testRun) {
+	tests = []testRun{{
+		Name:     "Bytes Transferred Metric",
+		URL:      "/metrics",
+		Method:   "GET",
+		Status:   http.StatusOK,
+		Contains: regexp.MustCompile(fmt.Sprintf("rclone_bytes_transferred_total %d", stats.GetBytes())),
+	}, {
+		Name:     "Checked Files Metric",
+		URL:      "/metrics",
+		Method:   "GET",
+		Status:   http.StatusOK,
+		Contains: regexp.MustCompile(fmt.Sprintf("rclone_checked_files_total %d", stats.GetChecks())),
+	}, {
+		Name:     "Errors Metric",
+		URL:      "/metrics",
+		Method:   "GET",
+		Status:   http.StatusOK,
+		Contains: regexp.MustCompile(fmt.Sprintf("rclone_errors_total %d", stats.GetErrors())),
+	}, {
+		Name:     "Deleted Files Metric",
+		URL:      "/metrics",
+		Method:   "GET",
+		Status:   http.StatusOK,
+		Contains: regexp.MustCompile(fmt.Sprintf("rclone_files_deleted_total %d", stats.Deletes(0))),
+	}, {
+		Name:     "Files Transferred Metric",
+		URL:      "/metrics",
+		Method:   "GET",
+		Status:   http.StatusOK,
+		Contains: regexp.MustCompile(fmt.Sprintf("rclone_files_transferred_total %d", stats.GetTransfers())),
+	},
+	}
+	return
+}
+
+var matchRemoteDirListing = regexp.MustCompile(`<title>Directory listing of /</title>`)
 
 func TestServingRoot(t *testing.T) {
 	tests := []testRun{{

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,7 +81,7 @@ func init() {
 			IsPassword: true,
 		}, {
 			Name: "bearer_token",
-			Help: "Bearer token instead of user/pass (eg a Macaroon)",
+			Help: "Bearer token instead of user/pass (e.g. a Macaroon)",
 		}, {
 			Name:     "bearer_token_command",
 			Help:     "Command to run to get a bearer token",
@@ -298,8 +299,7 @@ func (o *Object) filePath() string {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	ctx := context.Background()
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -336,13 +336,13 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		opt:         *opt,
 		endpoint:    u,
 		endpointURL: u.String(),
-		srv:         rest.NewClient(fshttp.NewClient(fs.Config)).SetRoot(u.String()),
-		pacer:       fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		srv:         rest.NewClient(fshttp.NewClient(ctx)).SetRoot(u.String()),
+		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		precision:   fs.ModTimeNotSupported,
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
-	}).Fill(f)
+	}).Fill(ctx, f)
 	if opt.User != "" || opt.Pass != "" {
 		f.srv.SetUserPass(opt.User, opt.Pass)
 	} else if opt.BearerToken != "" {
@@ -358,6 +358,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if err != nil {
 		return nil, err
 	}
+	f.srv.SetHeader("Referer", u.String())
 
 	if root != "" && !rootIsDir {
 		// Check to see if the root actually an existing file
@@ -684,8 +685,8 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 
 // mkParentDir makes the parent of the native path dirPath if
 // necessary and any directories above that
-func (f *Fs) mkParentDir(ctx context.Context, dirPath string) error {
-	// defer log.Trace(dirPath, "")("")
+func (f *Fs) mkParentDir(ctx context.Context, dirPath string) (err error) {
+	// defer log.Trace(dirPath, "")("err=%v", &err)
 	// chop off trailing / if it exists
 	if strings.HasSuffix(dirPath, "/") {
 		dirPath = dirPath[:len(dirPath)-1]
@@ -695,6 +696,27 @@ func (f *Fs) mkParentDir(ctx context.Context, dirPath string) error {
 		parent = ""
 	}
 	return f.mkdir(ctx, parent)
+}
+
+// _dirExists - list dirPath to see if it exists
+//
+// dirPath should be a native path ending in a /
+func (f *Fs) _dirExists(ctx context.Context, dirPath string) (exists bool) {
+	opts := rest.Opts{
+		Method: "PROPFIND",
+		Path:   dirPath,
+		ExtraHeaders: map[string]string{
+			"Depth": "0",
+		},
+	}
+	var result api.Multistatus
+	var resp *http.Response
+	var err error
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallXML(ctx, &opts, nil, &result)
+		return f.shouldRetry(resp, err)
+	})
+	return err == nil
 }
 
 // low level mkdir, only makes the directory, doesn't attempt to create parents
@@ -717,19 +739,29 @@ func (f *Fs) _mkdir(ctx context.Context, dirPath string) error {
 		return f.shouldRetry(resp, err)
 	})
 	if apiErr, ok := err.(*api.Error); ok {
-		// already exists
+		// Check if it already exists. The response code for this isn't
+		// defined in the RFC so the implementations vary wildly.
+		//
 		// owncloud returns 423/StatusLocked if the create is already in progress
 		if apiErr.StatusCode == http.StatusMethodNotAllowed || apiErr.StatusCode == http.StatusNotAcceptable || apiErr.StatusCode == http.StatusLocked {
 			return nil
 		}
+		// 4shared returns a 409/StatusConflict here which clashes
+		// horribly with the intermediate paths don't exist meaning. So
+		// check to see if actually exists. This will correct other
+		// error codes too.
+		if f._dirExists(ctx, dirPath) {
+			return nil
+		}
+
 	}
 	return err
 }
 
 // mkdir makes the directory and parents using native paths
-func (f *Fs) mkdir(ctx context.Context, dirPath string) error {
-	// defer log.Trace(dirPath, "")("")
-	err := f._mkdir(ctx, dirPath)
+func (f *Fs) mkdir(ctx context.Context, dirPath string) (err error) {
+	// defer log.Trace(dirPath, "")("err=%v", &err)
+	err = f._mkdir(ctx, dirPath)
 	if apiErr, ok := err.(*api.Error); ok {
 		// parent does not exist so create it first then try again
 		if apiErr.StatusCode == http.StatusConflict {
@@ -799,7 +831,7 @@ func (f *Fs) Precision() time.Duration {
 	return f.precision
 }
 
-// Copy or Move src to this remote using server side copy operations.
+// Copy or Move src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -837,7 +869,7 @@ func (f *Fs) copyOrMove(ctx context.Context, src fs.Object, remote string, metho
 		},
 	}
 	if f.useOCMtime {
-		opts.ExtraHeaders["X-OC-Mtime"] = fmt.Sprintf("%f", float64(src.ModTime(ctx).UnixNano())/1e9)
+		opts.ExtraHeaders["X-OC-Mtime"] = fmt.Sprintf("%d", src.ModTime(ctx).Unix())
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
@@ -853,7 +885,7 @@ func (f *Fs) copyOrMove(ctx context.Context, src fs.Object, remote string, metho
 	return dstObj, nil
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -866,16 +898,16 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return f.copyOrMove(ctx, src, remote, "COPY")
 }
 
-// Purge deletes all the files and the container
+// Purge deletes all the files in the directory
 //
 // Optional interface: Only implement this if you have a way of
 // deleting all the files quicker than just running Remove() on the
 // result of List()
-func (f *Fs) Purge(ctx context.Context) error {
-	return f.purgeCheck(ctx, "", false)
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, false)
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -889,7 +921,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -974,10 +1006,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
  </D:prop>
 </D:propfind>
 `))
-	var q = api.Quota{
-		Available: -1,
-		Used:      -1,
-	}
+	var q api.Quota
 	var resp *http.Response
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
@@ -988,13 +1017,14 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		return nil, errors.Wrap(err, "about call failed")
 	}
 	usage := &fs.Usage{}
-	if q.Available != 0 || q.Used != 0 {
-		if q.Available >= 0 && q.Used >= 0 {
-			usage.Total = fs.NewUsageValue(q.Available + q.Used)
-		}
-		if q.Used >= 0 {
-			usage.Used = fs.NewUsageValue(q.Used)
-		}
+	if i, err := strconv.ParseInt(q.Used, 10, 64); err == nil && i >= 0 {
+		usage.Used = fs.NewUsageValue(i)
+	}
+	if i, err := strconv.ParseInt(q.Available, 10, 64); err == nil && i >= 0 {
+		usage.Free = fs.NewUsageValue(i)
+	}
+	if usage.Used != nil && usage.Free != nil {
+		usage.Total = fs.NewUsageValue(*usage.Used + *usage.Free)
 	}
 	return usage, nil
 }
@@ -1133,11 +1163,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		NoResponse:    true,
 		ContentLength: &size, // FIXME this isn't necessary with owncloud - See https://github.com/nextcloud/nextcloud-snap/issues/365
 		ContentType:   fs.MimeType(ctx, src),
+		Options:       options,
 	}
 	if o.fs.useOCMtime || o.fs.hasMD5 || o.fs.hasSHA1 {
 		opts.ExtraHeaders = map[string]string{}
 		if o.fs.useOCMtime {
-			opts.ExtraHeaders["X-OC-Mtime"] = fmt.Sprintf("%f", float64(src.ModTime(ctx).UnixNano())/1e9)
+			opts.ExtraHeaders["X-OC-Mtime"] = fmt.Sprintf("%d", src.ModTime(ctx).Unix())
 		}
 		// Set one upload checksum
 		// Owncloud uses one checksum only to check the upload and stores its own SHA1 and MD5

@@ -25,6 +25,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/random"
@@ -68,9 +69,10 @@ func Initialise() {
 	// parse the flags any more so this doesn't happen
 	// automatically
 	if envConfig := os.Getenv("RCLONE_CONFIG"); envConfig != "" {
-		config.ConfigPath = envConfig
+		_ = config.SetConfigPath(envConfig)
 	}
-	config.LoadConfig(ctx)
+	configfile.Install()
+	accounting.Start(ctx)
 	if *Verbose {
 		ci.LogLevel = fs.LogLevelDebug
 	}

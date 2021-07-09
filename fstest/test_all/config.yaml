@@ -43,6 +43,10 @@ backends:
    fastlist: true
    maxfile:  6k
  - backend:  "chunker"
+   remote:   "TestChunkerChunk3bNoRenameLocal:"
+   fastlist: true
+   maxfile:  6k
+ - backend:  "chunker"
    remote:   "TestChunkerMailru:"
    fastlist: true
  - backend:  "chunker"
@@ -185,6 +189,9 @@ backends:
  - backend:  "sftp"
    remote:   "TestSFTPRclone:"
    fastlist: false
+ - backend:  "sftp"
+   remote:   "TestSFTPRsyncNet:"
+   fastlist: false
  - backend:  "sugarsync"
    remote:   "TestSugarSync:Test"
    fastlist: false
@@ -319,3 +326,8 @@ backends:
    fastlist: false
    ignore:
      - TestSyncUTFNorm
+ - backend: "uptobox"
+   remote: "TestUptobox:"
+   fastlist: false
+   ignore:
+     - TestRWFileHandleWriteNoWrite

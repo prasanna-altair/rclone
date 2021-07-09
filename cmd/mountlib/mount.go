@@ -206,9 +206,9 @@ When that happens, it is the user's responsibility to stop the mount manually.
 The size of the mounted file system will be set according to information retrieved
 from the remote, the same as returned by the [rclone about](https://rclone.org/commands/rclone_about/)
 command. Remotes with unlimited storage may report the used size only,
-then an additional 1PB of free space is assumed. If the remote does not
+then an additional 1 PiB of free space is assumed. If the remote does not
 [support](https://rclone.org/overview/#optional-features) the about feature
-at all, then 1PB is set as both the total and the free size.
+at all, then 1 PiB is set as both the total and the free size.
 
 **Note**: As of |rclone| 1.52.2, |rclone mount| now requires Go version 1.13
 or newer on some platforms depending on the underlying FUSE library in use.
@@ -334,7 +334,7 @@ metadata about files like in UNIX. One case that may arise is that other program
 (incorrectly) interprets this as the file being accessible by everyone. For example
 an SSH client may warn about "unprotected private key file".
 
-WinFsp 2021 (version 1.9, still in beta) introduces a new FUSE option "FileSecurity",
+WinFsp 2021 (version 1.9) introduces a new FUSE option "FileSecurity",
 that allows the complete specification of file security descriptors using
 [SDDL](https://docs.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-string-format).
 With this you can work around issues such as the mentioned "unprotected private key file"
@@ -342,19 +342,38 @@ by specifying |-o FileSecurity="D:P(A;;FA;;;OW)"|, for file all access (FA) to t
 
 #### Windows caveats
 
-Note that drives created as Administrator are not visible by other
-accounts (including the account that was elevated as
-Administrator). So if you start a Windows drive from an Administrative
-Command Prompt and then try to access the same drive from Explorer
-(which does not run as Administrator), you will not be able to see the
-new drive.
+Drives created as Administrator are not visible to other accounts,
+not even an account that was elevated to Administrator with the
+User Account Control (UAC) feature. A result of this is that if you mount
+to a drive letter from a Command Prompt run as Administrator, and then try
+to access the same drive from Windows Explorer (which does not run as
+Administrator), you will not be able to see the mounted drive.
 
-The easiest way around this is to start the drive from a normal
-command prompt. It is also possible to start a drive from the SYSTEM
-account (using [the WinFsp.Launcher
-infrastructure](https://github.com/billziss-gh/winfsp/wiki/WinFsp-Service-Architecture))
-which creates drives accessible for everyone on the system or
-alternatively using [the nssm service manager](https://nssm.cc/usage).
+If you don't need to access the drive from applications running with
+administrative privileges, the easiest way around this is to always
+create the mount from a non-elevated command prompt.
+
+To make mapped drives available to the user account that created them
+regardless if elevated or not, there is a special Windows setting called
+[linked connections](https://docs.microsoft.com/en-us/troubleshoot/windows-client/networking/mapped-drives-not-available-from-elevated-command#detail-to-configure-the-enablelinkedconnections-registry-entry)
+that can be enabled.
+
+It is also possible to make a drive mount available to everyone on the system,
+by running the process creating it as the built-in SYSTEM account.
+There are several ways to do this: One is to use the command-line
+utility [PsExec](https://docs.microsoft.com/en-us/sysinternals/downloads/psexec),
+from Microsoft's Sysinternals suite, which has option |-s| to start
+processes as the SYSTEM account. Another alternative is to run the mount
+command from a Windows Scheduled Task, or a Windows Service, configured
+to run as the SYSTEM account. A third alternative is to use the
+[WinFsp.Launcher infrastructure](https://github.com/billziss-gh/winfsp/wiki/WinFsp-Service-Architecture)).
+Note that when running rclone as another user, it will not use
+the configuration file from your profile unless you tell it to
+with the [|--config|](https://rclone.org/docs/#config-config-file) option.
+Read more in the [install documentation](https://rclone.org/install/).
+
+Note that mapping to a directory path, instead of a drive letter,
+does not suffer from the same limitations.
 
 ### Limitations
 

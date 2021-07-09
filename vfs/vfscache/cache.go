@@ -135,7 +135,7 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 	}
 
 	// Remove any empty directories
-	c.purgeEmptyDirs()
+	c.purgeEmptyDirs("", true)
 
 	// Create a channel for cleaner to be kicked upon out of space con
 	c.kick = make(chan struct{}, 1)
@@ -237,7 +237,8 @@ func (c *Cache) InUse(name string) bool {
 	return item.inUse()
 }
 
-// DirtyItem the Item if it exists in the cache and is Dirty
+// DirtyItem returns the Item if it exists in the cache **and** is
+// dirty otherwise it returns nil.
 //
 // name should be a remote path not an osPath
 func (c *Cache) DirtyItem(name string) (item *Item) {
@@ -341,6 +342,49 @@ func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error
 
 	fs.Infof(name, "vfs cache: renamed in cache to %q", newName)
 	return nil
+}
+
+// DirExists checks to see if the directory exists in the cache or not.
+func (c *Cache) DirExists(name string) bool {
+	path := c.toOSPath(name)
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// DirRename the dir in cache
+func (c *Cache) DirRename(oldDirName string, newDirName string) (err error) {
+	// Make sure names are / suffixed for reading keys out of c.item
+	if !strings.HasSuffix(oldDirName, "/") {
+		oldDirName += "/"
+	}
+	if !strings.HasSuffix(newDirName, "/") {
+		newDirName += "/"
+	}
+
+	// Find all items to rename
+	var renames []string
+	c.mu.Lock()
+	for itemName := range c.item {
+		if strings.HasPrefix(itemName, oldDirName) {
+			renames = append(renames, itemName)
+		}
+	}
+	c.mu.Unlock()
+
+	// Rename the items
+	for _, itemName := range renames {
+		newPath := newDirName + itemName[len(oldDirName):]
+		renameErr := c.Rename(itemName, newPath, nil)
+		if renameErr != nil {
+			err = renameErr
+		}
+	}
+
+	// Old path should be empty now so remove it
+	c.purgeEmptyDirs(oldDirName[:len(oldDirName)-1], false)
+
+	fs.Infof(oldDirName, "vfs cache: renamed dir in cache to %q", newDirName)
+	return err
 }
 
 // Remove should be called if name is deleted
@@ -505,7 +549,7 @@ func (c *Cache) purgeClean(quota int64) {
 
 	// Make a slice of clean cache files
 	for _, item := range c.item {
-		if !item.IsDataDirty() {
+		if !item.IsDirty() {
 			items = append(items, item)
 		}
 	}
@@ -554,15 +598,15 @@ func (c *Cache) purgeOld(maxAge time.Duration) {
 }
 
 // Purge any empty directories
-func (c *Cache) purgeEmptyDirs() {
+func (c *Cache) purgeEmptyDirs(dir string, leaveRoot bool) {
 	ctx := context.Background()
-	err := operations.Rmdirs(ctx, c.fcache, "", true)
+	err := operations.Rmdirs(ctx, c.fcache, dir, leaveRoot)
 	if err != nil {
-		fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from cache: %v", err)
+		fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from cache path %q: %v", dir, err)
 	}
-	err = operations.Rmdirs(ctx, c.fcacheMeta, "", true)
+	err = operations.Rmdirs(ctx, c.fcacheMeta, dir, leaveRoot)
 	if err != nil {
-		fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from metadata cache: %v", err)
+		fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from metadata cache path %q: %v", dir, err)
 	}
 }
 
@@ -614,7 +658,7 @@ func (c *Cache) purgeOverQuota(quota int64) {
 }
 
 // clean empties the cache of stuff if it can
-func (c *Cache) clean(removeCleanFiles bool) {
+func (c *Cache) clean(kicked bool) {
 	// Cache may be empty so end
 	_, err := os.Stat(c.root)
 	if os.IsNotExist(err) {
@@ -630,18 +674,17 @@ func (c *Cache) clean(removeCleanFiles bool) {
 		// Remove any files that are over age
 		c.purgeOld(c.opt.CacheMaxAge)
 
+		if int64(c.opt.CacheMaxSize) <= 0 {
+			break
+		}
+
 		// Now remove files not in use until cache size is below quota starting from the
 		// oldest first
 		c.purgeOverQuota(int64(c.opt.CacheMaxSize))
 
-		// removeCleanFiles indicates that we got ENOSPC error
-		// We remove cache files that are not dirty if we are still above the max cache size
-		if removeCleanFiles {
-			c.purgeClean(int64(c.opt.CacheMaxSize))
-			c.retryFailedResets()
-		} else {
-			break
-		}
+		// Remove cache files that are not dirty if we are still above the max cache size
+		c.purgeClean(int64(c.opt.CacheMaxSize))
+		c.retryFailedResets()
 
 		used := c.updateUsed()
 		if used <= int64(c.opt.CacheMaxSize) && len(c.errItems) == 0 {
@@ -650,7 +693,7 @@ func (c *Cache) clean(removeCleanFiles bool) {
 	}
 
 	// Was kicked?
-	if removeCleanFiles {
+	if kicked {
 		c.kickerMu.Lock() // Make sure this is called with cache mutex unlocked
 		// Reenable io threads to kick me
 		c.cleanerKicked = false
@@ -693,9 +736,9 @@ func (c *Cache) cleaner(ctx context.Context) {
 	for {
 		select {
 		case <-c.kick: // a thread encountering ENOSPC kicked me
-			c.clean(true) // remove inUse files that are clean (!item.info.Dirty)
+			c.clean(true) // kicked is true
 		case <-timer.C:
-			c.clean(false) // do not remove inUse files
+			c.clean(false) // timer driven cache poll, kicked is false
 		case <-ctx.Done():
 			fs.Debugf(nil, "vfs cache: cleaner exiting")
 			return
